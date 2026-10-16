@@ -77,7 +77,7 @@ machine. It is also the last step of CI.
 
 Comparing with git found things that no documentation or intuition had suggested. A selection, all fixed and now covered by tests:
 
-* A `.gitignore` line like `k**/**` matches `keep.txt`: git compares the literal prefix (`k`) on its own and hands only the *rest* of the pattern to the glob matcher, which
+* In git 2.39 a `.gitignore` line like `k**/**` matches `keep.txt` (later versions fixed this; the tests keep clear of it): git compares the literal prefix (`k`) on its own and hands only the *rest* of the pattern to the glob matcher, which
   then sees `**/` at the start of a pattern. Also: CRLF line endings are stripped from patterns, and a glob that matches nothing but ignored files "matches nothing".
 * `git add <path>` reports an ignored *directory* that the path points into, even when files below it are tracked, but only after it has staged everything else.
 * `git log` indents blank lines of a message with four spaces; `git tag -m` drops lines starting with `#` while `git commit -m` keeps them.

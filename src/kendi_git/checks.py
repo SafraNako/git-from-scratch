@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -344,7 +345,8 @@ def check_ignore(tmp, rng, scale):
         for _ in range(rng.randint(2, 6)):
             pat = "/".join("".join(rng.choice(atoms) for _ in range(rng.randint(1, 2))) for _ in range(rng.randint(1, 3)))
             pat = ("**/" if rng.random() < 0.2 else "") + pat + ("/" if rng.random() < 0.3 else "")
-            lines.append(("!" if rng.random() < 0.2 else "") + ("/" if rng.random() < 0.2 else "") + pat)
+            pat = ("!" if rng.random() < 0.2 else "") + ("/" if rng.random() < 0.2 else "") + pat
+            lines.append(re.sub(r"(?<=[^/!])\*\*", "*", pat))      # "x**/" glued to text differs between git versions: keep clear of it
         write(repo, ".gitignore", "\n".join(lines) + "\n")
         files = {"/".join(rng.choice(["a", "b", "build", "tmp", "keep", "x.txt", "y.log", "z.o", "ab"]) for _ in range(rng.randint(1, 3))) for _ in range(20)}
         placed = []

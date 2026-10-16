@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import stat
 
 import pytest
@@ -156,7 +157,8 @@ def random_pattern(rng):
         pat += "/"
     if rng.random() < 0.25:
         pat = "!" + pat
-    return pat
+    # "x**/" glued to literal text was matched differently by git 2.39 (literal-prefix quirk, reproduced here) and by later versions: keep generated patterns out of it
+    return re.sub(r"(?<=[^/!])\*\*", "*", pat)
 
 
 def random_tree(rng):
