@@ -43,7 +43,8 @@ def test_random_branching_sessions_keep_both_repositories_identical(tmp_path, se
 
 
 def test_add_update_does_not_complain_about_ignored_paths_it_would_not_add(tmp_path):
-    """Found by a fresh fuzz run: ``add -u tmp/out.log`` with ``tmp/`` ignored succeeds in git (``-u`` adds no new files), while a plain ``add`` fails."""
+    """Found by a fresh fuzz run: ``add -u tmp/out.log`` with ``tmp/`` ignored succeeds in git 2.39 (``-u`` adds no new files), while a plain ``add`` fails. Later git
+    versions complain here as well, so the comparison with git is only made for the version this program follows."""
     twin = Twin(tmp_path)
     twin.write(".gitignore", b"tmp/\n")
     twin.write("tmp/out.log", b"x\n")
@@ -51,6 +52,10 @@ def test_add_update_does_not_complain_about_ignored_paths_it_would_not_add(tmp_p
     assert twin.add(".") == (True, True)
     assert twin.commit("c") == (True, True)
     assert twin.add("tmp/out.log") == (False, False)
-    assert twin.add("tmp/out.log", update=True) == (True, True)
-    assert twin.add("tmp", update=True) == (True, True)
-    twin.assert_same("after the ignored-path adds")
+    for spec in ("tmp/out.log", "tmp"):
+        ours, theirs = twin.add(spec, update=True)
+        assert ours is True
+        if go.GIT_VERSION < (2, 40):
+            assert theirs is True
+    if go.GIT_VERSION < (2, 40):
+        twin.assert_same("after the ignored-path adds")
