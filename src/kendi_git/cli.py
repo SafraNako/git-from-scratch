@@ -1,0 +1,615 @@
+"""The ``kgit`` command line.
+
+Command names and options follow git's (so muscle memory and scripts carry over), prose output is in Turkish, machine formats (``status --porcelain``, ``ls-files
+--stage``, ``log --oneline``, patches) are git's own byte for byte. ``main`` takes the streams, the environment and the clock as arguments so that tests drive the real
+code paths without a subprocess.
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import os
+import sys
+
+from . import __version__
+from . import checkout as co
+from . import diff as df
+from . import fsck as fsck_mod
+from . import index as ix
+from . import merge as mg
+from .config import ConfigFile
+from .errors import GitError
+from .objects import MODE_GITLINK, MODE_TREE, hash_object, parse_tree
+from .repo import NothingToCommit, Pathspec, Repo, relative_to
+
+
+class Out:
+    """Writes text or bytes to a text stream (through its ``buffer`` when it has one) or to a binary stream such as ``io.BytesIO``."""
+
+    def __init__(self, stream):
+        self.text = stream
+        self.stream = getattr(stream, "buffer", stream)
+        self.binary = hasattr(stream, "buffer") or isinstance(self.stream, (io.RawIOBase, io.BufferedIOBase))
+
+    def write(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8", "surrogateescape")
+        if self.binary:
+            if self.text is not self.stream:
+                self.text.flush()
+            self.stream.write(data)
+            self.stream.flush()
+        else:
+            self.stream.write(data.decode("utf-8", "surrogateescape"))
+
+    def line(self, text=""):
+        self.write(text + "\n")
+
+
+# --- argument parsing ----------------------------------------------------------------------------------------------------------------------------
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise UsageError(message)
+
+
+class UsageError(Exception):
+    pass
+
+
+def build_parser():
+    p = _Parser(prog="kgit", description="A Git client written from scratch (Turkish output, git-compatible repositories).")
+    p.add_argument("-C", dest="chdir", metavar="DIR", help="run as if started in DIR")
+    p.add_argument("--version", action="version", version="kgit " + __version__)
+    sub = p.add_subparsers(dest="command", parser_class=_Parser)
+
+    def cmd(name, **kw):
+        return sub.add_parser(name, **kw)
+
+    c = cmd("init", help="create an empty repository")
+    c.add_argument("directory", nargs="?", default=".")
+    c.add_argument("-b", "--initial-branch", default="main")
+
+    c = cmd("hash-object", help="compute (and optionally store) an object id")
+    c.add_argument("-w", action="store_true", dest="write")
+    c.add_argument("-t", default="blob", dest="kind")
+    c.add_argument("--stdin", action="store_true")
+    c.add_argument("files", nargs="*")
+
+    c = cmd("cat-file", help="show an object")
+    g = c.add_mutually_exclusive_group(required=True)
+    g.add_argument("-t", action="store_true", dest="show_type")
+    g.add_argument("-s", action="store_true", dest="show_size")
+    g.add_argument("-p", action="store_true", dest="pretty")
+    g.add_argument("-e", action="store_true", dest="exists")
+    g.add_argument("--type", dest="kind", help="print the raw content of an object of this type")
+    c.add_argument("object")
+
+    c = cmd("ls-tree", help="list the contents of a tree")
+    c.add_argument("-r", action="store_true", dest="recursive")
+    c.add_argument("-z", action="store_true")
+    c.add_argument("--name-only", action="store_true")
+    c.add_argument("--full-tree", action="store_true", help="list from the repository root even from a subdirectory")
+    c.add_argument("tree")
+
+    c = cmd("ls-files", help="list the files of the index")
+    c.add_argument("-s", "--stage", action="store_true")
+    c.add_argument("-z", action="store_true")
+    c.add_argument("-o", "--others", action="store_true")
+    c.add_argument("--exclude-standard", action="store_true")
+    c.add_argument("--full-name", action="store_true", help="print paths relative to the repository root even from a subdirectory")
+
+    cmd("write-tree", help="write the index as tree objects")
+
+    c = cmd("rev-parse", help="resolve revisions to object ids")
+    c.add_argument("--short", action="store_true")
+    c.add_argument("--short-length", type=int, default=None, help=argparse.SUPPRESS)       # what "--short=N" becomes (see main)
+    c.add_argument("--verify", action="store_true")
+    c.add_argument("--show-toplevel", action="store_true")
+    c.add_argument("--git-dir", action="store_true")
+    c.add_argument("specs", nargs="*")
+
+    c = cmd("add", help="stage files")
+    c.add_argument("-u", "--update", action="store_true")
+    c.add_argument("-A", "--all", action="store_true")
+    c.add_argument("-f", "--force", action="store_true")
+    c.add_argument("-v", "--verbose", action="store_true")
+    c.add_argument("paths", nargs="*")
+
+    c = cmd("rm", help="remove files from the index and the work tree")
+    c.add_argument("--cached", action="store_true")
+    c.add_argument("-f", "--force", action="store_true")
+    c.add_argument("-r", action="store_true", dest="recursive")
+    c.add_argument("paths", nargs="*")
+
+    c = cmd("status", help="show the state of the work tree")
+    c.add_argument("-s", "--short", action="store_true")
+    c.add_argument("--porcelain", action="store_true")
+    c.add_argument("-z", action="store_true")
+    c.add_argument("-b", "--branch", action="store_true", help="with --short, show the branch line")
+    c.add_argument("-u", "--untracked-files", nargs="?", const="all", default="normal", choices=["no", "normal", "all"], dest="untracked")
+
+    c = cmd("commit", help="record the staged changes")
+    c.add_argument("-m", "--message", action="append", dest="messages")
+    c.add_argument("-a", "--all", action="store_true")
+    c.add_argument("--amend", action="store_true")
+    c.add_argument("--allow-empty", action="store_true")
+
+    c = cmd("log", help="show the history")
+    c.add_argument("--oneline", action="store_true")
+    c.add_argument("-n", "--max-count", type=int)
+    c.add_argument("revs", nargs="*")
+
+    c = cmd("show", help="show a commit, tag, tree or blob")
+    c.add_argument("-U", dest="context", type=int, default=3)
+    c.add_argument("object", nargs="?", default="HEAD")
+
+    c = cmd("diff", help="show changes")
+    c.add_argument("--cached", "--staged", action="store_true", dest="cached")
+    c.add_argument("-U", dest="context", type=int, default=3)
+    c.add_argument("--numstat", action="store_true")
+    c.add_argument("--name-only", action="store_true")
+    c.add_argument("--name-status", action="store_true")
+    c.add_argument("args", nargs="*")
+
+    c = cmd("branch", help="list, create, rename or delete branches")
+    c.add_argument("-d", "--delete", action="store_true")
+    c.add_argument("-D", action="store_true", dest="force_delete")
+    c.add_argument("-m", "--move", action="store_true")
+    c.add_argument("-f", "--force", action="store_true")
+    c.add_argument("names", nargs="*")
+
+    c = cmd("checkout", help="switch branches or restore files")
+    c.add_argument("-b", dest="create")
+    c.add_argument("--detach", action="store_true")
+    c.add_argument("args", nargs="*")
+
+    c = cmd("reset", help="move the current branch (and optionally the index and work tree)")
+    g = c.add_mutually_exclusive_group()
+    g.add_argument("--soft", action="store_true")
+    g.add_argument("--mixed", action="store_true")
+    g.add_argument("--hard", action="store_true")
+    c.add_argument("target", nargs="?", default="HEAD")
+
+    c = cmd("tag", help="list, create or delete tags")
+    c.add_argument("-a", action="store_true", dest="annotate")
+    c.add_argument("-m", dest="message")
+    c.add_argument("-d", action="store_true", dest="delete")
+    c.add_argument("-f", action="store_true", dest="force")
+    c.add_argument("names", nargs="*")
+
+    c = cmd("merge", help="merge a branch into the current one")
+    c.add_argument("--no-ff", action="store_true")
+    c.add_argument("--ff-only", action="store_true")
+    c.add_argument("-m", dest="message")
+    c.add_argument("target")
+
+    c = cmd("fsck", help="verify the object database")
+    c.add_argument("--no-strict", action="store_true")
+    c.add_argument("--dangling", action="store_true")
+
+    c = cmd("config", help="read or write configuration")
+    c.add_argument("--list", "-l", action="store_true", dest="list_all")
+    c.add_argument("--get", action="store_true")
+    c.add_argument("--global", action="store_true", dest="use_global")
+    c.add_argument("args", nargs="*")
+
+    c = cmd("dogrulama", help="run the self-verification battery against real git")
+    c.add_argument("--quick", action="store_true")
+    return p
+
+
+# --- helpers -------------------------------------------------------------------------------------------------------------------------------------
+STATUS_WORDS = {"A": "yeni dosya", "M": "değiştirilmiş", "D": "silinmiş", "T": "tür değişmiş", "U": "çakışmalı"}
+
+
+def _tree_lines(repo, oid, recursive=False, names_only=False, prefix="", quote=True):
+    """``git ls-tree`` lines; names with unusual bytes are C-quoted unless ``quote`` is off (``-z``)."""
+    q = df.quote_path if quote else (lambda p: p)
+    lines = []
+    for e in parse_tree(repo.odb.read(oid)[1]):
+        kind = "tree" if e.mode == MODE_TREE else "commit" if e.mode == MODE_GITLINK else "blob"
+        if recursive and e.mode == MODE_TREE:
+            lines += _tree_lines(repo, e.oid, True, names_only, prefix + e.name + "/", quote)
+        else:
+            name = q(prefix + e.name)
+            lines.append(name if names_only else "%06o %s %s\t%s" % (e.mode, kind, e.oid, name))
+    return lines
+
+
+def print_long_status(repo, status, out, prefix=""):
+    branch = status.branch
+    out.line("Dal: %s" % branch if branch else "HEAD ayrık (detached): %s" % (status.head or "")[:7])
+    if status.head is None:
+        out.line("")
+        out.line("Henüz commit yok")
+    staged = [(x, p) for x, y, p in status.entries if x not in " U" and not (x == "A" and y == "U")]
+    unstaged = [(y, p) for x, y, p in status.entries if y not in " " and x != "U"]
+    unmerged = [p for x, y, p in status.entries if "U" in (x, y) or (x, y) in (("A", "A"), ("D", "D"))]
+    if unmerged:
+        out.line("")
+        out.line("Çakışmalı (birleştirilmemiş) yollar:")
+        for p in unmerged:
+            out.line("\t" + relative_to(p, prefix))
+    if staged:
+        out.line("")
+        out.line("Commit'e hazırlanan değişiklikler:")
+        for x, p in staged:
+            out.line("\t%-14s %s" % (STATUS_WORDS.get(x, x) + ":", relative_to(p, prefix)))
+    if unstaged:
+        out.line("")
+        out.line("Hazırlanmamış değişiklikler:")
+        for y, p in unstaged:
+            out.line("\t%-14s %s" % (STATUS_WORDS.get(y, y) + ":", relative_to(p, prefix)))
+    if status.untracked:
+        out.line("")
+        out.line("Takip edilmeyen dosyalar:")
+        for p in status.untracked:
+            out.line("\t" + relative_to(p, prefix))
+    if status.clean:
+        out.line("")
+        out.line("Çalışma ağacı temiz: commit edilecek bir şey yok." if status.head else "Commit edilecek bir şey yok (dosyaları 'kgit add' ile hazırla).")
+
+
+def _split_revs_and_paths(repo, args, after, dashdash):
+    """``[<rev> [<rev>]] [--] [<path>...]``: with ``--`` everything before it is a revision and everything after a path; without it, tokens that resolve as revisions
+    come first and the rest are paths (git's rule)."""
+    if dashdash:
+        return args, after
+    revs = []
+    for i, token in enumerate(args):
+        try:
+            repo.rev_parse(token)
+            revs.append(token)
+        except GitError:
+            return revs, args[i:]
+        if len(revs) == 2:
+            return revs, args[i + 1:]
+    return revs, []
+
+
+def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
+    cmd = ns.command
+    if cmd == "init":
+        target = os.path.abspath(os.path.join(cwd, ns.directory))
+        existed = os.path.isdir(os.path.join(target, ".git", "objects"))
+        os.makedirs(target, exist_ok=True)
+        Repo.init(target, branch=ns.initial_branch, env=env, now=now)
+        out.line(("Mevcut Git deposu yeniden başlatıldı: " if existed else "Boş Git deposu oluşturuldu: ") + os.path.join(target, ".git") + "/")
+        return 0
+    if cmd == "dogrulama":
+        from . import checks
+        return checks.run(out, quick=ns.quick)
+    repo = repo_factory()
+    if cmd == "hash-object":
+        files = list(ns.files)
+        if ns.stdin:
+            data_list = [(stdin or sys.stdin.buffer).read()]
+        else:
+            data_list = []
+            for f in files:
+                with open(os.path.join(cwd, f), "rb") as fh:
+                    data_list.append(fh.read())
+        for data in data_list:
+            oid = repo.odb.write(ns.kind, data) if ns.write else hash_object(ns.kind, data)
+            out.line(oid)
+        return 0
+    if cmd == "cat-file":
+        oid = repo.rev_parse(ns.object)
+        if ns.exists:
+            return 0 if repo.odb.exists(oid) else 1
+        kind, data = repo.odb.read(oid)
+        if ns.show_type:
+            out.line(kind)
+        elif ns.show_size:
+            out.line(str(len(data)))
+        elif ns.kind:
+            if ns.kind != kind:
+                raise GitError(f"object {oid} is a {kind}, not a {ns.kind}")
+            out.write(data)
+        elif kind == "tree":
+            for line in _tree_lines(repo, oid):
+                out.line(line)
+        else:
+            out.write(data)
+        return 0
+    if cmd == "ls-tree":
+        oid = repo.peel(repo.rev_parse(ns.tree), "tree")
+        prefix = repo.rel_cwd(cwd)
+        if prefix and not ns.full_tree:                           # like git, list the directory we are in
+            oid = repo.rev_parse(oid + ":" + prefix)
+        sep = "\0" if ns.z else "\n"
+        for line in _tree_lines(repo, oid, ns.recursive, ns.name_only, quote=not ns.z):
+            out.write(line + sep)
+        return 0
+    if cmd == "ls-files":
+        index = repo.read_index()
+        sep = "\0" if ns.z else "\n"
+        prefix = repo.rel_cwd(cwd)
+        here = (lambda p: p.startswith(prefix + "/")) if prefix else (lambda p: True)
+        shown = (lambda p: p) if (ns.full_name or not prefix) else (lambda p: p[len(prefix) + 1:])
+        if ns.others:
+            for p in repo.walk_untracked_candidates(index, ignore=ns.exclude_standard):
+                if here(p):
+                    out.write((shown(p) if ns.z else df.quote_path(shown(p))) + sep)
+            return 0
+        for e in sorted(index.entries.values(), key=ix.IndexEntry.key):
+            if not here(e.path):
+                continue
+            path = shown(e.path) if ns.z else df.quote_path(shown(e.path))
+            out.write(("%06o %s %d\t%s" % (e.mode, e.oid, e.stage, path) if ns.stage else path) + sep)
+        return 0
+    if cmd == "write-tree":
+        out.line(ix.index_to_tree(repo.odb, repo.read_index()))
+        return 0
+    if cmd == "rev-parse":
+        if ns.show_toplevel:
+            out.line(repo.worktree)
+        if ns.git_dir:
+            out.line(repo.gitdir)
+        for spec in ns.specs:
+            oid = repo.rev_parse(spec)
+            out.line(repo.odb.abbrev(oid, ns.short_length) if (ns.short or ns.short_length) else oid)
+        return 0
+    if cmd == "add":
+        paths, prefix = ns.paths + ns.after, repo.rel_cwd(cwd)
+        if not paths and (ns.update or ns.all):                    # "git add -u" and "git add -A" without a path act on the whole work tree
+            paths, prefix = ["."], ""
+        if not paths:
+            raise GitError("nothing specified, nothing added")
+        staged, removed, warnings = repo.add(paths, prefix=prefix, update=ns.update, force=ns.force)
+        for w in warnings:
+            err.line("uyarı: " + w)
+        if ns.verbose:
+            for p in staged:
+                out.line("add '%s'" % p)
+            for p in removed:
+                out.line("remove '%s'" % p)
+        return 0
+    if cmd == "rm":
+        paths = ns.paths + ns.after
+        if not paths:
+            raise GitError("no pathspec given: which files should I remove?")
+        for p in repo.rm(paths, prefix=repo.rel_cwd(cwd), cached=ns.cached, force=ns.force, recursive=ns.recursive):
+            out.line("rm '%s'" % p)
+        return 0
+    if cmd == "status":
+        status = repo.status(untracked=ns.untracked)
+        if ns.porcelain or ns.short:
+            if ns.z:
+                for x, y, p in status.entries:
+                    out.write("%s%s %s\0" % (x, y, p))
+                for p in status.untracked:
+                    out.write("?? %s\0" % p)
+            else:
+                if ns.branch:
+                    out.line("## " + ("No commits yet on %s" % status.branch if status.head is None and status.branch else status.branch or "HEAD (no branch)"))
+                for line in status.porcelain_lines(prefix="" if ns.porcelain else repo.rel_cwd(cwd)):
+                    out.line(line)
+        else:
+            print_long_status(repo, status, out, repo.rel_cwd(cwd))
+        return 0
+    if cmd == "commit":
+        if not ns.messages and not ns.amend:
+            raise GitError("a commit message is required: use -m \"message\" (no editor is started)")
+        message = "\n\n".join(ns.messages) if ns.messages else None
+        if ns.all:
+            repo.add(["."], prefix="", update=True)
+        before = repo.refs.head_oid()
+        try:
+            oid = repo.commit(message, amend=ns.amend, allow_empty=ns.allow_empty)
+        except NothingToCommit:
+            print_long_status(repo, repo.status(), out, repo.rel_cwd(cwd))
+            err.line("kgit: commit edilecek değişiklik yok")
+            return 1
+        c = repo.read_commit(oid)
+        branch = repo.refs.current_branch() or "HEAD (detached)"
+        out.line("[%s%s %s] %s" % (branch, " (root-commit)" if before is None and not ns.amend else "", repo.odb.abbrev(oid), c.subject))
+        return 0
+    if cmd == "log":
+        if ns.after:
+            raise GitError("log -- <path> (history simplification) is not implemented")
+        include, exclude = [], []
+        for spec in ns.revs or ["HEAD"]:
+            if ".." in spec and "..." not in spec:
+                a, b = spec.split("..", 1)
+                exclude.append(repo.commit_of(a or "HEAD"))
+                include.append(repo.commit_of(b or "HEAD"))
+            elif spec.startswith("^"):
+                exclude.append(repo.commit_of(spec[1:]))
+            else:
+                include.append(repo.commit_of(spec))
+        if not include:
+            raise GitError("no revision to start from")
+        first = True
+        for oid in repo.walk(include, exclude, limit=ns.max_count):
+            if ns.oneline:
+                out.line(repo.format_commit(oid, oneline=True))
+            else:
+                if not first:
+                    out.line("")
+                out.write(repo.format_commit(oid))
+            first = False
+        return 0
+    if cmd == "show":
+        oid = repo.rev_parse(ns.object)
+        kind, data = repo.odb.read(oid)
+        if kind == "commit":
+            out.write(repo.show_commit(oid, ns.context))
+        elif kind == "tag":
+            out.write(repo.show_tag(oid, ns.context))
+        elif kind == "tree":
+            out.line("tree %s\n" % ns.object)
+            for line in _tree_lines(repo, oid, names_only=True):
+                out.line(line)
+        else:
+            out.write(data)
+        return 0
+    if cmd == "diff":
+        revs, paths = _split_revs_and_paths(repo, ns.args, ns.after, ns.dashdash)
+        if len(revs) > 2:
+            raise GitError("too many revisions: diff takes at most two")
+        ps = Pathspec(paths, repo.rel_cwd(cwd)) if paths else None
+        if len(revs) == 2:
+            changes = repo.changes_commits(repo.commit_of(revs[0]), repo.commit_of(revs[1]), ps)
+        elif len(revs) == 1:
+            commit = repo.commit_of(revs[0])
+            changes = repo.changes_cached(commit, ps) if ns.cached else repo.changes_against_commit(commit, ps)
+        else:
+            changes = repo.changes_cached(None, ps) if ns.cached else repo.changes_worktree(ps)
+        if ns.numstat or ns.name_only or ns.name_status:
+            for path, old, new in changes:
+                quoted = df.quote_path(path)
+                if ns.name_only:
+                    out.line(quoted)
+                elif ns.name_status:
+                    out.line("%s\t%s" % ("A" if old is None else "D" if new is None else "M", quoted))
+                else:
+                    counted = df.counts(old, new)
+                    out.line("%s\t%s\t%s" % (counted[0] if counted else "-", counted[1] if counted else "-", quoted))
+        else:
+            out.write(repo.render_changes(changes, ns.context))
+        return 0
+    if cmd == "branch":
+        names = ns.names
+        if ns.delete or ns.force_delete:
+            for n in names:
+                oid = repo.delete_branch(n, force=ns.force_delete)
+                out.line("Dal silindi: %s (%s)" % (n, repo.odb.abbrev(oid)))
+        elif ns.move:
+            if len(names) == 1:
+                names = [repo.refs.current_branch() or "", names[0]]
+            repo.rename_branch(names[0], names[1])
+        elif names:
+            repo.create_branch(names[0], names[1] if len(names) > 1 else None, force=ns.force)
+        else:
+            current = repo.refs.current_branch()
+            for n, _oid in repo.branches():
+                out.line(("* " if n == current else "  ") + n)
+        return 0
+    if cmd == "checkout":
+        prefix = repo.rel_cwd(cwd)
+        if ns.dashdash:
+            if len(ns.args) > 1 or not ns.after:
+                raise GitError("usage: kgit checkout [<revision>] -- <path>...")
+            for p in co.restore(repo, ns.after, prefix, ns.args[0] if ns.args else None):
+                out.line("geri yüklendi: " + p)
+            return 0
+        target = ns.args[0] if ns.args else None
+        if ns.create and len(ns.args) > 1:
+            raise GitError("too many arguments")
+        result = co.checkout(repo, target, create=ns.create, detach=ns.detach)
+        out.line({"already": "Zaten '%s' dalındasın." % result.name, "branch": "'%s' dalına geçildi." % result.name,
+                  "new-branch": "Yeni '%s' dalı oluşturuldu ve ona geçildi." % result.name,
+                  "detached": "HEAD ayrık (detached): %s %s" % (repo.odb.abbrev(result.oid), result.subject)}[result.kind])
+        return 0
+    if cmd == "reset":
+        mode = "soft" if ns.soft else "hard" if ns.hard else "mixed"
+        oid, subject = co.reset(repo, ns.target, mode)
+        out.line("HEAD artık şurada: %s %s" % (repo.odb.abbrev(oid), subject))
+        return 0
+    if cmd == "tag":
+        names = ns.names
+        if ns.delete:
+            for n in names:
+                repo.delete_tag(n)
+                out.line("Etiket silindi: " + n)
+        elif names:
+            if ns.annotate and not ns.message:
+                raise GitError("an annotated tag needs a message: use -m \"message\" (no editor is started)")
+            repo.create_tag(names[0], names[1] if len(names) > 1 else None, ns.message if (ns.annotate or ns.message) else None, force=ns.force)
+        else:
+            for n, _oid in repo.tags():
+                out.line(n)
+        return 0
+    if cmd == "merge":
+        ff = "never" if ns.no_ff else "only" if ns.ff_only else "allow"
+        try:
+            result = mg.merge(repo, ns.target, message=ns.message, ff=ff)
+        except mg.MergeConflict as exc:
+            err.line("kgit: birleştirme çakışması: " + ", ".join(exc.conflicts))
+            err.line("Hiçbir şey değiştirilmedi. Çakışmaları elle çöz ya da dalları farklı yolla birleştir.")
+            return 1
+        if result.kind == "up-to-date":
+            out.line("Zaten güncel.")
+        elif result.kind == "fast-forward":
+            out.line("İleri sarma (fast-forward): %s..%s" % (repo.odb.abbrev(result.old) if result.old else "(boş)", repo.odb.abbrev(result.oid)))
+        else:
+            out.line("Birleştirme commit'i oluşturuldu: %s" % repo.odb.abbrev(result.oid))
+        return 0
+    if cmd == "fsck":
+        report = fsck_mod.fsck(repo, strict=not ns.no_strict)
+        for line in report.errors:
+            err.line(line)
+        if ns.dangling:
+            for kind, oid in report.dangling:
+                out.line("dangling %s %s" % (kind, oid))
+        out.line("%d nesne denetlendi; %s" % (report.objects, "sorun yok." if report.ok else "%d sorun bulundu." % len(report.errors)))
+        return 0 if report.ok else 1
+    if cmd == "config":
+        return _config(ns, repo_factory, out, env, cwd)
+    raise GitError(f"unknown command {cmd!r}")
+
+
+def _config(ns, repo_factory, out, env, cwd):
+    if ns.use_global:
+        path = env.get("GIT_CONFIG_GLOBAL") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".gitconfig")
+        cfg = ConfigFile(path)
+        layers = [cfg]
+    else:
+        repo = repo_factory()
+        layers = None
+        cfg = repo.config.local
+    if ns.list_all:
+        source = layers or repo.config.layers
+        for layer in source:
+            for key, value in layer.entries():
+                out.line(key if value is None else "%s=%s" % (key, value))
+        return 0
+    if not ns.args:
+        raise GitError("usage: kgit config [--global] [--get] <key> [<value>]  |  kgit config --list")
+    key = ns.args[0]
+    if len(ns.args) == 1 or ns.get:
+        values = cfg.get_all(key) if ns.use_global else repo.config.get_all(key)
+        if not values:
+            return 1
+        out.line("" if values[-1] is None else values[-1])
+        return 0
+    cfg.set(key, ns.args[1])
+    cfg.save()
+    return 0
+
+
+def main(argv=None, stdout=None, stderr=None, cwd=None, env=None, now=None, stdin=None):
+    argv = ["--short-length=" + a[len("--short="):] if a.startswith("--short=") else a for a in (sys.argv[1:] if argv is None else argv)]
+    out, err = Out(stdout or sys.stdout), Out(stderr or sys.stderr)
+    env = dict(os.environ if env is None else env)
+    cwd = os.path.abspath(cwd or os.getcwd())
+    try:
+        split = argv.index("--") if "--" in argv else None            # "--" separates revisions from paths; argparse would swallow it, so it is handled here
+        ns = build_parser().parse_args(argv if split is None else argv[:split])
+        ns.dashdash, ns.after = split is not None, ([] if split is None else argv[split + 1:])
+        if ns.chdir:
+            cwd = os.path.abspath(os.path.join(cwd, ns.chdir))
+        if ns.command is None:
+            build_parser().print_help(stderr or sys.stderr)
+            return 2
+        factory = lambda: Repo.discover(cwd, env=env, now=now)  # noqa: E731
+        return run(ns, factory, out, err, env, cwd, now, stdin)
+    except UsageError as exc:
+        err.line("kgit: kullanım hatası: %s" % exc)
+        return 2
+    except GitError as exc:
+        err.line("kgit: hata: %s" % exc)
+        return 1
+    except BrokenPipeError:
+        return 1
+    except (OSError, KeyboardInterrupt) as exc:
+        err.line("kgit: hata: %s" % exc)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+__all__ = ["main", "build_parser"]
