@@ -40,3 +40,17 @@ def test_random_branching_sessions_keep_both_repositories_identical(tmp_path, se
             twin.assert_same(f"after round {n}: {steps[-1]}")
         except AssertionError as exc:
             raise AssertionError(f"{exc}\nsteps so far: " + "\n  ".join([""] + history)) from None
+
+
+def test_add_update_does_not_complain_about_ignored_paths_it_would_not_add(tmp_path):
+    """Found by a fresh fuzz run: ``add -u tmp/out.log`` with ``tmp/`` ignored succeeds in git (``-u`` adds no new files), while a plain ``add`` fails."""
+    twin = Twin(tmp_path)
+    twin.write(".gitignore", b"tmp/\n")
+    twin.write("tmp/out.log", b"x\n")
+    twin.write("a.txt", b"a\n")
+    assert twin.add(".") == (True, True)
+    assert twin.commit("c") == (True, True)
+    assert twin.add("tmp/out.log") == (False, False)
+    assert twin.add("tmp/out.log", update=True) == (True, True)
+    assert twin.add("tmp", update=True) == (True, True)
+    twin.assert_same("after the ignored-path adds")

@@ -52,7 +52,7 @@ As a library: `from kendi_git.repo import Repo` (see [`examples/walkthrough.py`]
 
 ## How it was validated
 
-The ground rule of this project: **a behaviour is only believed once real git has agreed with it.** The suite has 239 tests; the bulk of them run both programs on the
+The ground rule of this project: **a behaviour is only believed once real git has agreed with it.** The suite has 240 tests; the bulk of them run both programs on the
 same input and compare the answers.
 
 | Component | Compared with git on |
@@ -65,7 +65,7 @@ same input and compare the answers.
 | Patches | `diff`, `diff --cached`, commit-to-commit and `show` byte for byte; 296 random patches of repetitive, code-like text (the hard case: many equally good edit scripts) are all byte-identical to `git diff` |
 | History | default log order (including ties and clock skew) on random DAGs, `A..B` ranges, merge bases (including criss-cross pairs), the log/show/date formats |
 | Merge | 300 + 300 random three-way line merges against `git merge-file` (verdict *and* merged text), 40 random tree merges against `git merge-tree`, and a merge commit that is the very same object git creates |
-| Whole sessions | random `add` / `rm` / `commit` / `branch` / `checkout` / `reset` / `merge` / `tag` sessions run in lock step in two repositories, one driven through this package and one through git: after **every step** HEAD, refs, index, work tree and `status` must be identical, and a refusal by one must be a refusal by the other (the suite runs 8 such sessions; longer runs of about 90 plain sessions of 45 steps and 24 branching sessions of 40 rounds each were made on earlier revisions while the divergences below were being found and fixed) |
+| Whole sessions | random `add` / `rm` / `commit` / `branch` / `checkout` / `reset` / `merge` / `tag` sessions run in lock step in two repositories, one driven through this package and one through git: after **every step** HEAD, refs, index, work tree and `status` must be identical, and a refusal by one must be a refusal by the other (the suite runs 8 such sessions; longer runs of about 90 plain sessions of 45 steps and 24 branching sessions of 40 rounds each were made on earlier revisions while the divergences below were being found and fixed, and a last round of 12 fresh branching sessions and 16 fresh plain ones passed; that round found one more divergence, `add -u` on an ignored path, which is fixed and covered by a test) |
 | `fsck` | missing, truncated, bit-flipped, mis-named objects, damaged packs, malformed trees/commits/tags, broken refs: the verdict and the culprit ids |
 | Real repositories | `tools/real_world_sweep.py`: 99 + 19 + 1 real repositories, 0 disagreements (below) |
 
@@ -102,7 +102,7 @@ work tree with its real stat data, dirty files and untracked files); the verdict
 |---|---|---|---|---|---|
 | Small portfolio projects | 99 | 2,915 | 118 | 114 / 114 | 0 |
 | Larger private repositories (up to 566 commits and 9,500 objects, 14 of them *shallow* clones, one with a dirty work tree of 29 changed and untracked paths) | 19 | 31,952 | 1,543 | 54 / 54 | 0 |
-| Homebrew's own repository (52,340 commits, 362,574 objects in 11 packs, 535 refs; 20,000 random objects read back, `fsck` over all of them) | 1 | 20,000 (of 362,574) | 52,340 | — | 0 |
+| Homebrew's own repository (52,340 commits, 362,574 objects in 11 packs, 535 refs; 20,000 random objects read back, `fsck` over all of them) | 1 | 20,000 (of 362,574) | 52,340 | 6 / 6 | 0 |
 
 All of it ran on an old laptop under a busy virus scanner; the Homebrew repository took 21 minutes, most of it in `git fsck` and this program's own `fsck`.
 

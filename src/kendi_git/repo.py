@@ -574,8 +574,8 @@ class Repo:
                             ps.match(rel + "/x")
                         continue
                     if not force and rules.is_ignored(rel, True):
-                        if ps.names_path(rel):                       # git reports an ignored directory that the command line points into, tracked content or not
-                            ignored_named.append(rel)
+                        if not update and ps.names_path(rel):        # git reports an ignored directory that the command line points into, tracked content or not
+                            ignored_named.append(rel)                # (but "add -u" adds no new files, so it has nothing to complain about)
                         if not any(p.startswith(rel + "/") for p in tracked_paths):
                             continue                                  # nothing is tracked below, so nothing below is considered
                     visit(rel)

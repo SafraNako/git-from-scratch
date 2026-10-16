@@ -116,23 +116,27 @@ def check_fsck(path, repo):
     return ours == theirs, "both %s" % ("clean" if theirs else "report problems")
 
 
-def check_diffs(path, repo, how_many=6):
+def check_diffs(path, repo, how_many=6, look_back=400):
+    """Patches of the latest ``how_many`` single-parent commits (merges and patches over 400 KB are skipped; at most ``look_back`` commits are looked at)."""
     head = repo.refs.head_oid()
     exact = counted = total = 0
     if head is None:
         return None, "no commits"
-    for oid in list(repo.walk([head], limit=how_many)):
+    for oid in repo.walk([head], limit=look_back):
+        if total >= how_many:
+            break
         parents = repo.read_commit(oid).parents
         if len(parents) > 1:
             continue
-        theirs = git(path, "diff", "--no-color", "--no-renames", (parents[0] if parents else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"), oid).stdout
+        base = parents[0] if parents else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        theirs = git(path, "diff", "--no-color", "--no-renames", base, oid).stdout
         if len(theirs) > 400_000:
             continue
         changes = repo.changes_commits(parents[0] if parents else None, oid)
         mine = repo.render_changes(changes)
         total += 1
         exact += mine == theirs
-        numstat = git(path, "diff", "--no-renames", "--numstat", (parents[0] if parents else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"), oid).stdout.decode("utf-8", "surrogateescape")
+        numstat = git(path, "diff", "--no-renames", "--numstat", base, oid).stdout.decode("utf-8", "surrogateescape")
         ours_counts = []
         for p, old, new in changes:
             c = df.counts(old, new)
@@ -147,9 +151,12 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--skip-diffs", action="store_true")
     ap.add_argument("--sample-objects", type=int, default=0, help="read back only this many random objects per repository")
+    ap.add_argument("--only", default="", help="comma-separated checks to run: objects,refs,history,index,status,fsck,worktree,diffs (default: all)")
     args = ap.parse_args()
     global SAMPLE
     SAMPLE = args.sample_objects
+    only = {x for x in args.only.split(",") if x}
+    wanted = lambda name: not only or name in only  # noqa: E731
     if not GIT:
         print("git is not installed: nothing to compare with")
         return 2
@@ -171,24 +178,30 @@ def main():
                 repo = Repo(os.path.join(clone, ".git"), clone, env=ENV)
                 results = []
                 for label, fn in (("objects", check_objects), ("refs", check_refs), ("history", check_history), ("index", check_index), ("status", check_status), ("fsck", check_fsck)):
+                    if not wanted(label):
+                        continue
                     ok, detail = fn(clone, repo)
                     results.append((label, ok, detail))
                     if not ok:
                         hard_failures.append((name, label, detail))
-                original = Repo(os.path.join(source, ".git"), source, env=ENV)
-                mine, theirs = porcelain(source, original)
-                results.append(("worktree", mine == theirs, "%d changed/untracked" % (len(theirs) - 1)))
-                if mine != theirs:
-                    hard_failures.append((name, "worktree", "status of the original work tree differs: %s" % sorted(set(mine) ^ set(theirs))[:4]))
-                if not args.skip_diffs:
+                if wanted("worktree"):
+                    original = Repo(os.path.join(source, ".git"), source, env=ENV)
+                    mine, theirs = porcelain(source, original)
+                    results.append(("worktree", mine == theirs, "%d changed/untracked" % (len(theirs) - 1)))
+                    if mine != theirs:
+                        hard_failures.append((name, "worktree", "status of the original work tree differs: %s" % sorted(set(mine) ^ set(theirs))[:4]))
+                if not args.skip_diffs and wanted("diffs"):
                     value, detail = check_diffs(clone, repo)
                     if value:
                         totals["exact"] += value[0]
                         totals["counted"] += value[1]
                         totals["diffs"] += value[2]
                     results.append(("diffs", True, detail))
-                totals["objects"] += int(results[0][2].split()[0]) if results[0][1] else 0
-                totals["commits"] += int(results[2][2].split()[0]) if results[2][2][0].isdigit() else 0
+                for r in results:
+                    if r[0] == "objects" and r[1]:
+                        totals["objects"] += int(r[2].split()[0])
+                    if r[0] == "history" and r[2][0].isdigit():
+                        totals["commits"] += int(r[2].split()[0])
                 rows.append((name, "ok" if all(r[1] for r in results) else "DIFFERS", "; ".join("%s: %s" % (r[0], r[2]) for r in results)))
             except (GitError, RuntimeError, OSError, ValueError) as exc:
                 hard_failures.append((name, "error", "%s: %s" % (type(exc).__name__, exc)))
