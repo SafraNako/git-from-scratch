@@ -25,6 +25,9 @@ IDENT = {"GIT_AUTHOR_NAME": "A U Thor", "GIT_AUTHOR_EMAIL": "author@example.org"
 def env(extra=None):
     e = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": HOME, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
          "LC_ALL": "C", "GIT_PAGER": "cat", "TZ": "UTC"}
+    # newer git runs automatic maintenance after commits and would expire reflog entries dated in 2023: switch that off for the oracle
+    e.update({"GIT_CONFIG_COUNT": "4", "GIT_CONFIG_KEY_0": "maintenance.auto", "GIT_CONFIG_VALUE_0": "false", "GIT_CONFIG_KEY_1": "gc.auto", "GIT_CONFIG_VALUE_1": "0",
+              "GIT_CONFIG_KEY_2": "gc.reflogExpire", "GIT_CONFIG_VALUE_2": "never", "GIT_CONFIG_KEY_3": "gc.reflogExpireUnreachable", "GIT_CONFIG_VALUE_3": "never"})
     e.update(IDENT)
     e.update(extra or {})
     return e
