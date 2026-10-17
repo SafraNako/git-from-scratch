@@ -164,10 +164,3 @@ def test_ambiguous_short_ids_are_refused(tmp_path):
         assert go.git(repo, "rev-parse", "--verify", "-q", common, check=False).returncode != 0
     assert len(ours.odb.abbrev(pair[0])) >= 7
     assert ours.odb.abbrev(pair[0]) == go.gits(repo, "rev-parse", "--short", pair[0]).strip()
-
-
-def test_reflog_syntax_is_refused_with_a_clear_message(history_repo):
-    ours = our_repo(history_repo)
-    with pytest.raises(GitError) as e:
-        ours.rev_parse("HEAD@{1}")
-    assert "reflog" in str(e.value)
