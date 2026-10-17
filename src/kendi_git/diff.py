@@ -647,3 +647,131 @@ def hash_data(data):
 
 __all__ = ["myers", "hunks", "format_hunks", "split_lines", "Change", "Side", "diff_flat", "render_change", "counts", "blob_side", "file_side", "quote_path", "is_binary",
            "MODE_FILE", "hash_data"]
+
+
+# --- diffstat: a port of show_stats() from git's diff.c --------------------------------------------------------------------------------------------
+def _decimal_width(n):
+    return len(str(n))
+
+
+def merge_typechanges(changes):
+    """The patch text shows a type change (file <-> symlink) as a removal plus an addition; every summary form (--stat, --numstat, --summary, --name-status) shows
+    one entry for the path. Pair them up again."""
+    out = []
+    for path, old, new in changes:
+        if out and out[-1][0] == path and out[-1][2] is None and out[-1][1] is not None and old is None and new is not None:
+            out[-1] = (path, out[-1][1], new)
+        else:
+            out.append((path, old, new))
+    return out
+
+
+def stat_rows(changes):
+    """One row per change for ``--stat``: ``(quoted name, added, deleted, binary)``. For a binary file ``added``/``deleted`` are the new/old sizes in bytes."""
+    rows = []
+    for path, old, new in merge_typechanges(changes):
+        a_data = old.bytes() if old else b""
+        b_data = new.bytes() if new else b""
+        if is_binary(a_data) or is_binary(b_data):
+            rows.append((quote_path(path), len(b_data), len(a_data), True))
+        else:
+            c = counts(old, new)
+            rows.append((quote_path(path), c[0], c[1], False))
+    return rows
+
+
+def _scale_linear(it, width, max_change):
+    return 0 if not it else 1 + (it * (width - 1) // max_change)
+
+
+def summary_line(files, adds, dels):
+    """git's ``N files changed, N insertions(+), N deletions(-)`` line (without the leading space handling of --shortstat's callers)."""
+    out = " %d file%s changed" % (files, "" if files == 1 else "s")
+    if adds or not dels:
+        out += ", %d insertion%s(+)" % (adds, "" if adds == 1 else "s")
+    if dels or not adds:
+        out += ", %d deletion%s(-)" % (dels, "" if dels == 1 else "s")
+    return out + "\n"
+
+
+def format_stat(changes, width=80):
+    """The text of ``git diff --stat`` for these changes (80 columns, as git prints when the output is not a terminal)."""
+    rows = stat_rows(changes)
+    if not rows:
+        return ""
+    max_len = max_change = bin_width = number_width = 0
+    for name, added, deleted, binary in rows:
+        max_len = max(max_len, len(name))
+        if binary:
+            bin_width = max(bin_width, 14 + _decimal_width(added) + _decimal_width(deleted))
+            number_width = 3
+            continue
+        max_change = max(max_change, added + deleted)
+    number_width = max(_decimal_width(max_change), number_width)
+    if width < 16 + 6 + number_width:
+        width = 16 + 6 + number_width
+    graph_width = max_change if max_change + 4 > bin_width else bin_width - 4
+    name_width = max_len
+    if name_width + number_width + 6 + graph_width > width:
+        if graph_width > width * 3 // 8 - number_width - 6:
+            graph_width = width * 3 // 8 - number_width - 6
+            if graph_width < 6:
+                graph_width = 6
+        if name_width > width - number_width - 6 - graph_width:
+            name_width = width - number_width - 6 - graph_width
+        else:
+            graph_width = width - number_width - 6 - name_width
+    out, adds, dels = [], 0, 0
+    for name, added, deleted, binary in rows:
+        prefix, length, shown = "", name_width, name
+        if name_width < len(name):
+            prefix = "..."
+            length -= 3
+            shown = name[len(name) - length:]
+            slash = shown.find("/")
+            if slash >= 0:
+                shown = shown[slash:]
+        line = " %s%s |" % (prefix, shown.ljust(length))
+        if binary:
+            line += " " + "Bin".rjust(number_width)
+            if not added and not deleted:
+                out.append(line + "\n")
+                continue
+            out.append(line + " %d -> %d bytes\n" % (deleted, added))
+            continue
+        add, dele = added, deleted
+        if graph_width <= max_change:
+            total = _scale_linear(add + dele, graph_width, max_change)
+            if total < 2 and add and dele:
+                total = 2
+            if add < dele:
+                add = _scale_linear(add, graph_width, max_change)
+                dele = total - add
+            else:
+                dele = _scale_linear(dele, graph_width, max_change)
+                add = total - dele
+        out.append(line + " " + str(added + deleted).rjust(number_width) + (" " if added + deleted else "") + "+" * add + "-" * dele + "\n")
+        adds += added
+        dels += deleted
+    return "".join(out) + summary_line(len(rows), adds, dels)
+
+
+def format_shortstat(changes):
+    rows = stat_rows(changes)
+    if not rows:
+        return ""
+    return summary_line(len(rows), sum(r[1] for r in rows if not r[3]), sum(r[2] for r in rows if not r[3]))
+
+
+def format_summary(changes):
+    """``--summary``: creations, deletions and mode changes."""
+    out = []
+    for path, old, new in merge_typechanges(changes):
+        q = quote_path(path)
+        if old is None:
+            out.append(" create mode %06o %s\n" % (new.mode, q))
+        elif new is None:
+            out.append(" delete mode %06o %s\n" % (old.mode, q))
+        elif old.mode != new.mode:
+            out.append(" mode change %06o => %06o %s\n" % (old.mode, new.mode, q))
+    return "".join(out)

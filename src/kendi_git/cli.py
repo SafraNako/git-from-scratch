@@ -19,6 +19,7 @@ from . import index as ix
 from . import merge as mg
 from .config import ConfigFile
 from .errors import GitError
+from .graph import Graph
 from .objects import MODE_GITLINK, MODE_TREE, hash_object, parse_tree
 from .repo import NothingToCommit, Pathspec, Repo, relative_to
 
@@ -136,17 +137,25 @@ def build_parser():
 
     c = cmd("log", help="show the history")
     c.add_argument("--oneline", action="store_true")
+    c.add_argument("--stat", action="store_true")
+    c.add_argument("--graph", action="store_true")
+    c.add_argument("--topo-order", action="store_true")
+    c.add_argument("--date-order", action="store_true")
     c.add_argument("-n", "--max-count", type=int)
     c.add_argument("revs", nargs="*")
 
     c = cmd("show", help="show a commit, tag, tree or blob")
     c.add_argument("-U", dest="context", type=int, default=3)
+    c.add_argument("--stat", action="store_true")
     c.add_argument("object", nargs="?", default="HEAD")
 
     c = cmd("diff", help="show changes")
     c.add_argument("--cached", "--staged", action="store_true", dest="cached")
     c.add_argument("-U", dest="context", type=int, default=3)
     c.add_argument("--numstat", action="store_true")
+    c.add_argument("--stat", action="store_true")
+    c.add_argument("--shortstat", action="store_true")
+    c.add_argument("--summary", action="store_true")
     c.add_argument("--name-only", action="store_true")
     c.add_argument("--name-status", action="store_true")
     c.add_argument("args", nargs="*")
@@ -182,6 +191,10 @@ def build_parser():
     c.add_argument("--ff-only", action="store_true")
     c.add_argument("-m", dest="message")
     c.add_argument("target")
+
+    c = cmd("reflog", help="show the reference log (where a branch or HEAD has been)")
+    c.add_argument("-n", "--max-count", type=int)
+    c.add_argument("ref", nargs="?", default="HEAD")
 
     c = cmd("fsck", help="verify the object database")
     c.add_argument("--no-strict", action="store_true")
@@ -265,6 +278,26 @@ def _split_revs_and_paths(repo, args, after, dashdash):
         if len(revs) == 2:
             return revs, args[i + 1:]
     return revs, []
+
+
+def _log_graph_entry(repo, graph, oid, ns, out, first):
+    """One commit of ``log --graph``: the separator row, the rows before the commit row, the commit row with its text, the rows of the other text lines, and any graph
+    rows that are still owed."""
+    c = repo.read_commit(oid)
+    graph.update(oid, c.parents)
+    if not first and not ns.oneline:
+        out.line(graph.padding_line())                                   # the blank line between entries also carries the graph
+    while True:
+        row, is_commit_row = graph.next_line()
+        if is_commit_row:
+            break
+        out.line(row)
+    text = repo.format_commit(oid, oneline=ns.oneline).rstrip("\n").split("\n")
+    out.line(row + text[0])
+    for line in text[1:]:
+        out.line(graph.padding_line() + line)
+    for rest in graph.remainder():
+        out.line(rest)
 
 
 def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
@@ -421,19 +454,37 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
         if not include:
             raise GitError("no revision to start from")
         first = True
-        for oid in repo.walk(include, exclude, limit=ns.max_count):
+        commits = list(repo.walk(include, exclude, limit=None if (ns.graph or ns.topo_order or ns.date_order) else ns.max_count))
+        if ns.graph or ns.topo_order or ns.date_order:                    # these orders need the whole list first; --graph implies --topo-order
+            commits = repo.order_commits(commits, "date" if ns.date_order else "topo")
+            if ns.max_count is not None:
+                commits = commits[:ns.max_count]
+        graph = Graph() if ns.graph else None
+        for oid in commits:
+            if graph is not None:
+                _log_graph_entry(repo, graph, oid, ns, out, first)
+                first = False
+                continue
             if ns.oneline:
                 out.line(repo.format_commit(oid, oneline=True))
             else:
                 if not first:
                     out.line("")
                 out.write(repo.format_commit(oid))
+            if ns.stat and len(repo.read_commit(oid).parents) < 2:
+                stat = df.format_stat(repo.commit_changes(oid))
+                if stat:
+                    out.write(("" if ns.oneline else "\n") + stat)
             first = False
         return 0
     if cmd == "show":
         oid = repo.rev_parse(ns.object)
         kind, data = repo.odb.read(oid)
-        if kind == "commit":
+        if kind == "commit" and ns.stat:
+            out.write(repo.format_commit(oid))
+            stat = df.format_stat(repo.commit_changes(oid)) if len(repo.read_commit(oid).parents) < 2 else ""
+            out.write(("\n" + stat) if stat else "")
+        elif kind == "commit":
             out.write(repo.show_commit(oid, ns.context))
         elif kind == "tag":
             out.write(repo.show_tag(oid, ns.context))
@@ -456,13 +507,15 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
             changes = repo.changes_cached(commit, ps) if ns.cached else repo.changes_against_commit(commit, ps)
         else:
             changes = repo.changes_cached(None, ps) if ns.cached else repo.changes_worktree(ps)
-        if ns.numstat or ns.name_only or ns.name_status:
-            for path, old, new in changes:
+        if ns.stat or ns.shortstat or ns.summary:
+            out.write((df.format_stat(changes) if ns.stat else df.format_shortstat(changes) if ns.shortstat else "") + (df.format_summary(changes) if ns.summary else ""))
+        elif ns.numstat or ns.name_only or ns.name_status:
+            for path, old, new in df.merge_typechanges(changes):
                 quoted = df.quote_path(path)
                 if ns.name_only:
                     out.line(quoted)
                 elif ns.name_status:
-                    out.line("%s\t%s" % ("A" if old is None else "D" if new is None else "M", quoted))
+                    out.line("%s\t%s" % ("A" if old is None else "D" if new is None else "T" if (old.mode == 0o120000) != (new.mode == 0o120000) else "M", quoted))
                 else:
                     counted = df.counts(old, new)
                     out.line("%s\t%s\t%s" % (counted[0] if counted else "-", counted[1] if counted else "-", quoted))
@@ -535,6 +588,16 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
             out.line("İleri sarma (fast-forward): %s..%s" % (repo.odb.abbrev(result.old) if result.old else "(boş)", repo.odb.abbrev(result.oid)))
         else:
             out.line("Birleştirme commit'i oluşturuldu: %s" % repo.odb.abbrev(result.oid))
+        return 0
+    if cmd == "reflog":
+        ref = ns.ref
+        if ref != "HEAD" and not ref.startswith("refs/"):
+            ref = next((c for c in ("refs/heads/" + ref, "refs/remotes/" + ref, "refs/tags/" + ref) if os.path.exists(repo.refs._log_path(c))), "refs/heads/" + ref)
+        entries = repo.refs.read_log(ref)
+        for n, (_old, new, _ident, _when, _tz, message) in enumerate(reversed(entries)):
+            if ns.max_count is not None and n >= ns.max_count:
+                break
+            out.line("%s %s@{%d}: %s" % (repo.odb.abbrev(new), ns.ref, n, message))
         return 0
     if cmd == "fsck":
         report = fsck_mod.fsck(repo, strict=not ns.no_strict)

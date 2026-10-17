@@ -12,9 +12,12 @@ import re
 from .errors import GitError
 from .objects import is_oid
 
+_PSEUDO = re.compile(r"^[A-Z][A-Z_]*$")
 _FORBIDDEN = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
 SYMREF = "ref: "
 _UNSET = object()
+ZERO = "0" * 40
+LOGGED_PREFIXES = ("refs/heads/", "refs/remotes/", "refs/notes/")
 
 
 def check_ref_format(name, onelevel=False):
@@ -34,8 +37,9 @@ def check_branch_name(name):
 
 
 class RefStore:
-    def __init__(self, gitdir):
+    def __init__(self, gitdir, log_all=True):
         self.gitdir = gitdir
+        self.log_all = log_all                            # core.logAllRefUpdates
 
     def _path(self, name):
         return os.path.join(self.gitdir, *name.split("/"))
@@ -174,23 +178,80 @@ class RefStore:
                 os.unlink(lock)
             raise
 
-    def update(self, name, oid, old=_UNSET):
-        """Point the direct reference ``name`` (or, for a symbolic ``HEAD``, the branch it names) at ``oid``. ``old`` is an optional compare-and-swap guard."""
+    def update(self, name, oid, old=_UNSET, log=None, also_log=()):
+        """Point the direct reference ``name`` (or, for a symbolic ``HEAD``, the branch it names) at ``oid``. ``old`` is an optional compare-and-swap guard.
+        ``log=(identity text, message)`` appends a reflog entry for the ref, and for every name in ``also_log`` (a branch update through ``HEAD`` is logged twice)."""
         if not is_oid(oid):
             raise GitError(f"{oid!r} is not an object id")
         raw = self.read_raw(name)
         if raw and raw[0] == "sym":                       # writing through HEAD updates the branch HEAD points at
-            return self.update(raw[1], oid, old)
-        if name != "HEAD" and not check_ref_format(name):
+            return self.update(raw[1], oid, old, log, tuple(also_log) + ((name,) if name == "HEAD" else ()))
+        if name != "HEAD" and not (check_ref_format(name) or _PSEUDO.match(name)):
             raise GitError(f"'{name}' is not a valid reference name")
         if raw is None:
             self._check_conflicts(name)
+        previous = self.read(name)
         self._write_locked(name, oid, old)
+        if log:                                           # like git: the ref itself is logged only if its value changed, the HEAD that pointed at it always
+            for target in ((name,) if previous != oid else ()) + tuple(also_log):
+                self.append_log(target, previous, oid, log[0], log[1])
 
     def set_symbolic(self, name, target):
         if not check_ref_format(target, onelevel=False):
             raise GitError(f"'{target}' is not a valid reference name")
         self._write_locked(name, SYMREF + target)
+
+    # --- reflogs ---------------------------------------------------------------------------------------------------------------------------------
+    def _log_path(self, name):
+        return os.path.join(self.gitdir, "logs", *name.split("/"))
+
+    def _is_logged(self, name):
+        if os.path.exists(self._log_path(name)):
+            return True
+        return self.log_all and (name == "HEAD" or name.startswith(LOGGED_PREFIXES))
+
+    def append_log(self, name, old, new, ident, message):
+        """Append ``<old> <new> <identity>\t<message>`` to the reflog of ``name`` (only for the refs git logs by default, or ones that already have a log)."""
+        if not self._is_logged(name):
+            return
+        path = self._log_path(name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        message = " ".join(message.split("\n")[0].split()) if message else ""
+        with open(path, "a", encoding="utf-8", errors="surrogateescape") as f:
+            f.write("%s %s %s\t%s\n" % (old or ZERO, new, ident, message))
+
+    def read_log(self, name):
+        """The reflog of ``name``, oldest entry first: ``[(old, new, identity text, time, tz, message)]``."""
+        try:
+            with open(self._log_path(name), encoding="utf-8", errors="surrogateescape") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            return []
+        out = []
+        for line in lines:
+            head, _, message = line.partition("\t")
+            parts = head.split(" ")
+            ident = " ".join(parts[2:])
+            m = re.search(r" (\d+) ([+-]\d{4})$", ident)
+            out.append((parts[0], parts[1], ident, int(m.group(1)) if m else 0, m.group(2) if m else "+0000", message))
+        return out
+
+    def delete_log(self, name):
+        path = self._log_path(name)
+        if os.path.exists(path):
+            os.unlink(path)
+            directory = os.path.dirname(path)
+            stop = os.path.join(self.gitdir, "logs")
+            while directory != stop and directory.startswith(stop) and not os.listdir(directory):
+                os.rmdir(directory)
+                directory = os.path.dirname(directory)
+
+    def move_log(self, old, new):
+        src = self._log_path(old)
+        if os.path.exists(src):
+            dst = self._log_path(new)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.replace(src, dst)
 
     def delete(self, name, old=_UNSET):
         """Remove a reference everywhere (loose file and packed line) and prune the directories that become empty."""
@@ -207,6 +268,7 @@ class RefStore:
             os.unlink(path)
         if os.path.exists(lock):
             os.unlink(lock)
+        self.delete_log(name)
         directory = os.path.dirname(path)
         keep = {os.path.join(self.gitdir, "refs"), os.path.join(self.gitdir, "refs", "heads"), os.path.join(self.gitdir, "refs", "tags")}
         while directory.startswith(os.path.join(self.gitdir, "refs") + os.sep) and directory not in keep and os.path.isdir(directory) and not os.listdir(directory):

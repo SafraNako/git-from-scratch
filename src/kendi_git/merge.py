@@ -205,14 +205,14 @@ def merge(repo, spec, message=None, ff="allow"):
     head = repo.refs.head_oid()
     if head is None:                                       # merging into an unborn branch just checks the commit out
         co.apply_switch(repo, {}, co.snapshot_of_commit(repo, target))
-        _advance(repo, target, None)
+        _advance(repo, target, None, "merge %s: Fast-forward" % spec)
         return MergeResult("fast-forward", target, None)
     if target == head or target in ancestors(repo, head):
         return MergeResult("up-to-date", head, head)
     old_files = co.snapshot_of_commit(repo, head)
     if head in ancestors(repo, target) and ff != "never":
         co.apply_switch(repo, old_files, co.snapshot_of_commit(repo, target))
-        _advance(repo, target, head)
+        _advance(repo, target, head, "merge %s: Fast-forward" % spec)
         return MergeResult("fast-forward", target, head)
     if ff == "only":
         raise GitError("not possible to fast-forward, aborting")
@@ -225,6 +225,9 @@ def merge(repo, spec, message=None, ff="allow"):
     if any(stage for _p, stage in index.entries):
         raise GitError("you have unmerged paths: finish resolving them first")
     if repo.index_files(index) != old_files:
+        entry = repo.log_entry("merge %s: updating HEAD" % spec)           # git logs this no-op update before it gives up on a dirty index
+        if entry:
+            repo.refs.append_log("HEAD", head, head, *entry)
         raise GitError("your index has changes that are not committed: commit or reset them before merging")
     merged, conflicts = merge_trees(repo, co.snapshot_of_commit(repo, bases[0]), old_files, co.snapshot_of_commit(repo, target))
     if conflicts:
@@ -232,10 +235,9 @@ def merge(repo, spec, message=None, ff="allow"):
     co.apply_switch(repo, old_files, merged)
     tree = ix.write_tree(repo.odb, merged)
     oid = repo.make_commit(tree, [head, target], message if message is not None else default_message(repo, spec, target))
-    _advance(repo, oid, head)
+    _advance(repo, oid, head, "merge %s: Merge made by the 'ort' strategy." % spec)
     return MergeResult("merge", oid, head)
 
 
-def _advance(repo, oid, old):
-    kind, value = repo.refs.head()
-    repo.refs.update(value if kind == "ref" else "HEAD", oid, old=old)
+def _advance(repo, oid, old, message):
+    repo._advance_head(oid, old, message)

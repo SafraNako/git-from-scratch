@@ -132,8 +132,8 @@ class Repo:
         self.env = dict(os.environ if env is None else env)
         self.now = now
         self.odb = ObjectDB(os.path.join(self.gitdir, "objects"))
-        self.refs = RefStore(self.gitdir)
         self.config = Config(self.gitdir, env=self.env)
+        self.refs = RefStore(self.gitdir, log_all=self.config.get_bool("core.logAllRefUpdates", True))
         self._commits = {}
         self._shallow = None
 
@@ -190,6 +190,13 @@ class Repo:
             cur = parent
 
     # --- small helpers -------------------------------------------------------------------------------------------------------------------------
+    def log_entry(self, message):
+        """``(identity text, message)`` for a reflog line, or ``None`` when no committer identity is configured."""
+        try:
+            return (str(identity("committer", self.config, self.env, now=self.clock())), message)
+        except GitError:
+            return None
+
     def clock(self):
         return int(self.now() if self.now else time.time())
 
@@ -280,6 +287,35 @@ class Repo:
     # --- revisions -------------------------------------------------------------------------------------------------------------------------------
     _OPS = re.compile(r"(~\d*|\^\{[^}]*\}|\^\d*)")           # "^{type}" must be tried before the plain parent suffix "^N"
 
+    def _reflog_selector(self, name, selector, original):
+        """Resolve ``name@{selector}`` where the selector is a number (the n-th previous value of the ref) or ``-n`` (the branch checked out n switches ago)."""
+        if not re.fullmatch(r"-?\d+", selector):
+            raise GitError(f"'{original}': only numeric reflog selectors are supported")
+        n = int(selector)
+        if n < 0:
+            switches = [e[5][len("checkout: moving from "):].split(" to ")[0] for e in self.refs.read_log("HEAD") if e[5].startswith("checkout: moving from ")]
+            if len(switches) < -n:
+                raise GitError(f"'{original}': only {len(switches)} checkout(s) have been made")
+            oid = self._resolve_name(switches[n])
+            if oid is None:
+                raise GitError(f"'{original}': unknown revision '{switches[n]}'")
+            return oid
+        if name in ("", "@"):
+            kind, value = self.refs.head()
+            ref = value if kind == "ref" else "HEAD"
+        elif name == "HEAD" or name.startswith("refs/"):
+            ref = name
+        else:
+            ref = next((c for c in ("refs/heads/" + name, "refs/tags/" + name, "refs/remotes/" + name) if self.refs.exists(c) or os.path.exists(self.refs._log_path(c))), None)
+            if ref is None:
+                raise GitError(f"unknown revision or path: '{original}'")
+        log = self.refs.read_log(ref)
+        if n >= len(log):
+            if n == 0 and self.refs.read(ref):
+                return self.refs.read(ref)
+            raise GitError(f"log for '{name or ref}' only has {len(log)} entries")
+        return log[len(log) - 1 - n][1]
+
     def _resolve_name(self, name):
         if is_oid(name) and self.odb.exists(name):
             return name
@@ -306,8 +342,11 @@ class Repo:
     def rev_parse(self, spec):
         """Resolve a revision expression: ``HEAD``, ``@``, branch/tag names, (abbreviated) ids, ``rev~N``, ``rev^N``, ``rev^{type}``, ``rev:path`` and ``:path``."""
         original = spec
-        if "@{" in spec:
-            raise GitError(f"'{spec}': reflog and upstream syntax (@{{...}}) is not supported (this program writes no reflogs)")
+        m = re.match(r"^([^~^:@{}]*)@\{([^}]*)\}(.*)$", spec)
+        if m:                                                          # name@{n}, @{n}, @{-n}: resolve through the reflog, then go on with the rest
+            spec = self._reflog_selector(m.group(1), m.group(2), original) + m.group(3)
+        elif "@{" in spec and not re.search(r"\^\{", spec):
+            raise GitError(f"'{spec}': unsupported @{{...}} selector")
         if spec.startswith(":") and not spec.startswith(":/"):
             m = re.fullmatch(r":([0-3]):(.*)", spec)
             stage, path = (int(m.group(1)), m.group(2)) if m else (0, spec[1:])
@@ -687,15 +726,18 @@ class Repo:
         if message is None:
             raise GitError("a commit message is required (-m)")
         oid = self.make_commit(tree, parents, message, author=author)
-        self._advance_head(oid, head)
+        kind = "commit (amend)" if amend else "commit (initial)" if head is None else "commit"
+        self._advance_head(oid, head, "%s: %s" % (kind, clean_message(message).split("\n")[0]))
         return oid
 
-    def _advance_head(self, oid, old):
+    def _advance_head(self, oid, old, message=None):
+        """Move the branch ``HEAD`` names (or a detached ``HEAD``) to ``oid``, logging ``message`` in the reflogs of both."""
         kind, value = self.refs.head()
+        log = self.log_entry(message) if message else None
         if kind == "ref":
-            self.refs.update(value, oid, old=old)
+            self.refs.update(value, oid, old=old, log=log, also_log=("HEAD",))
         else:
-            self.refs.update("HEAD", oid, old=old)
+            self.refs.update("HEAD", oid, old=old, log=log)
 
     # --- history ---------------------------------------------------------------------------------------------------------------------------------
     def reachable(self, tips):
@@ -734,6 +776,45 @@ class Repo:
                 return
             for parent in self.read_commit(oid).parents:
                 push(parent)
+
+    def order_commits(self, commits, mode):
+        """Reorder a walk result like git's ``--topo-order`` (no commit before all its children, a branch shown to the end before the next one starts) or
+        ``--date-order`` (the same guarantee, but the newest available commit first)."""
+        parents = {c: self.read_commit(c).parents for c in commits}
+        indegree = {c: 1 for c in commits}
+        for c in commits:
+            for p in parents[c]:
+                if indegree.get(p):
+                    indegree[p] += 1
+        tips = [c for c in commits if indegree[c] == 1]
+        out, counter = [], 0
+        if mode == "topo":
+            stack = list(reversed(tips))                     # a stack: the most recently released parent is shown next
+            take, put = stack.pop, stack.append
+        else:
+            heap = []
+
+            def put(c):
+                nonlocal counter
+                counter += 1
+                heapq.heappush(heap, (-self.read_commit(c).committer.time, counter, c))
+
+            def take():
+                return heapq.heappop(heap)[2]
+            for c in tips:
+                put(c)
+            stack = heap
+        while stack:
+            c = take()
+            for p in parents[c]:
+                if not indegree.get(p):
+                    continue
+                indegree[p] -= 1
+                if indegree[p] == 1:
+                    put(p)
+            indegree[c] = 0
+            out.append(c)
+        return out
 
     def format_commit(self, oid, oneline=False):
         c = self.read_commit(oid)
@@ -809,6 +890,11 @@ class Repo:
         new = self.tree_files(self.read_commit(b).tree) if b else {}
         return self.changes_snapshots(old, new, paths)
 
+    def commit_changes(self, oid):
+        """The changes a commit made against its first parent (against the empty tree for a root commit)."""
+        parents = self.read_commit(oid).parents
+        return self.changes_commits(parents[0] if parents else None, oid)
+
     def render_changes(self, changes, context=3):
         return b"".join(df.render_change(path, old, new, self.odb.abbrev, context) for path, old, new in changes)
 
@@ -859,7 +945,7 @@ class Repo:
         oid = self.commit_of(start) if start else self.refs.head_oid()
         if oid is None:
             raise GitError("not a valid object name: 'HEAD' (the current branch has no commits yet)")
-        self.refs.update(ref, oid)
+        self.refs.update(ref, oid, log=self.log_entry("branch: Created from %s" % (start or self.refs.current_branch() or "HEAD")))
         return oid
 
     def delete_branch(self, name, force=False):
@@ -885,10 +971,18 @@ class Repo:
         if self.refs.exists("refs/heads/" + new):
             raise GitError(f"a branch named '{new}' already exists")
         current = self.refs.current_branch() == old
+        message = "Branch: renamed refs/heads/%s to refs/heads/%s" % (old, new)
         self.refs.update("refs/heads/" + new, oid)
+        self.refs.move_log("refs/heads/" + old, "refs/heads/" + new)
         if current:
             self.refs.set_symbolic("HEAD", "refs/heads/" + new)
         self.refs.delete("refs/heads/" + old)
+        entry = self.log_entry(message)
+        if entry:
+            self.refs.append_log("refs/heads/" + new, oid, oid, *entry)
+            if current:
+                self.refs.append_log("HEAD", oid, oid, *entry)
+                self.refs.append_log("HEAD", oid, oid, *entry)             # git really writes this one twice (the ref rename and the HEAD update)
 
     def tags(self):
         return [(n[len("refs/tags/"):], oid) for n, oid in self.refs.list("refs/tags/")]

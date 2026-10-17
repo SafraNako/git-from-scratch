@@ -122,6 +122,10 @@ class Twin:
         ok = self.both(lambda: mg.merge(self.ours, spec, ff=ff), "-c", "merge.renames=false", "-c", "diff.renames=false", "merge", "-q", "--no-edit", *flags, spec)
         if not ok[1] and os.path.exists(os.path.join(self.theirs_dir, ".git", "MERGE_HEAD")):
             go.git(self.theirs_dir, "merge", "--abort", check=False)           # real git leaves conflicts in the work tree; ours refuses and leaves nothing behind
+            log = os.path.join(self.theirs_dir, ".git", "logs", "HEAD")        # (the abort is a reset that git logs; ours made no move at all)
+            lines = open(log).read().splitlines(True)
+            if lines and lines[-1].rstrip().endswith("reset: moving to HEAD"):
+                open(log, "w").write("".join(lines[:-1]))
         return ok
 
     # --- comparisons -------------------------------------------------------------------------------------------------------------------------
@@ -167,8 +171,26 @@ class Twin:
     def refs_of(d):
         return go.git(d, "for-each-ref", "--format=%(refname) %(objectname) %(objecttype)").decode().splitlines() + [go.git(d, "symbolic-ref", "-q", "HEAD", check=False).stdout.decode().strip()]
 
+    @staticmethod
+    def logs_of(d):
+        """Every reflog file below ``.git/logs``: relative path -> text."""
+        base = os.path.join(d, ".git", "logs")
+        out = {}
+        for cur, _dirs, files in os.walk(base):
+            for f in files:
+                out[os.path.relpath(os.path.join(cur, f), base)] = open(os.path.join(cur, f), encoding="utf-8", errors="surrogateescape").read()
+        return out
+
     def assert_same(self, label="", worktree=True):
         assert self.refs_of(self.ours_dir) == self.refs_of(self.theirs_dir), f"refs differ {label}: {self.refs_of(self.ours_dir)} vs {self.refs_of(self.theirs_dir)}"
+        ours_logs, theirs_logs = self.logs_of(self.ours_dir), self.logs_of(self.theirs_dir)
+        if ours_logs != theirs_logs:
+            import difflib
+            lines = []
+            for name in sorted(set(ours_logs) | set(theirs_logs)):
+                lines += [f"[{name}] {ln[:2]} {ln[2:][:160]}" for ln in difflib.unified_diff(theirs_logs.get(name, "").splitlines(), ours_logs.get(name, "").splitlines(), "git", "ours", lineterm="", n=0)
+                          if not ln.startswith(("---", "+++", "@@"))]
+            raise AssertionError(f"reflogs differ {label} (- git, + ours): " + " | ".join(lines))
         if worktree:
             ours_tree, theirs_tree = self.tree_snapshot(self.ours_dir), self.tree_snapshot(self.theirs_dir)
             # empty directories are not tracked by git: the two sides may keep different leftovers

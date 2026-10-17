@@ -215,19 +215,29 @@ def checkout(repo, target, create=None, detach=False):
         branch_ref = "refs/heads/" + target
         new_oid = repo.refs.read(branch_ref)
         if repo.refs.head() == ("ref", branch_ref):
+            entry = repo.log_entry("checkout: moving from %s to %s" % (target, target))        # git records even a switch to the branch it is already on
+            if entry:
+                repo.refs.append_log("HEAD", head_oid, head_oid, *entry)
             return Switched("already", target, new_oid)
     elif target is None:
         raise GitError("nothing to check out")
     else:
         new_oid = repo.commit_of(target)
     apply_switch(repo, old, snapshot_of_commit(repo, new_oid))
+    kind, value = repo.refs.head()
+    came_from = value[len("refs/heads/"):] if kind == "ref" and value.startswith("refs/heads/") else (value if kind == "detached" else repo.refs.current_branch() or "HEAD")
     if create:
-        repo.refs.update(branch_ref, new_oid)
+        repo.refs.update(branch_ref, new_oid, log=repo.log_entry("branch: Created from %s" % (target or "HEAD")))
     if branch_ref:
         repo.refs.set_symbolic("HEAD", branch_ref)
-        return Switched("new-branch" if create else "branch", branch_ref[len("refs/heads/"):], new_oid, repo.read_commit(new_oid).subject)
-    repo.refs._write_locked("HEAD", new_oid)
-    return Switched("detached", "", new_oid, repo.read_commit(new_oid).subject)
+        result = Switched("new-branch" if create else "branch", branch_ref[len("refs/heads/"):], new_oid, repo.read_commit(new_oid).subject)
+    else:
+        repo.refs._write_locked("HEAD", new_oid)
+        result = Switched("detached", "", new_oid, repo.read_commit(new_oid).subject)
+    entry = repo.log_entry("checkout: moving from %s to %s" % (came_from, create or (result.name if result.kind == "branch" else target)))
+    if entry:
+        repo.refs.append_log("HEAD", head_oid, new_oid, *entry)
+    return result
 
 
 def reset(repo, target="HEAD", mode="mixed"):
@@ -248,11 +258,7 @@ def reset(repo, target="HEAD", mode="mixed"):
         repo.write_index(fresh)
     if head_oid:
         repo.refs._write_locked("ORIG_HEAD", head_oid)
-    kind, value = repo.refs.head()
-    if kind == "ref":
-        repo.refs.update(value, new_oid)
-    else:
-        repo.refs._write_locked("HEAD", new_oid)
+    repo._advance_head(new_oid, head_oid, "reset: moving to %s" % target)
     return new_oid, repo.read_commit(new_oid).subject
 
 
