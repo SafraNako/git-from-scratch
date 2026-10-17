@@ -80,6 +80,9 @@ def plan_switch(repo, old, new, index, force=False):
 
     paths = sorted(set(old) | set(new) | set(entries), key=lambda p: p.encode("utf-8", "surrogateescape"))
     if force:
+        for path in sorted(unmerged):                                     # a path that only exists as unmerged stages goes away if the target lacks it
+            if path not in new and path not in entries:
+                removals.append(path)
         for path in paths:
             n, e = new.get(path), entries.get(path)
             cur = (e.mode, e.oid) if e else None
@@ -244,6 +247,9 @@ def reset(repo, target="HEAD", mode="mixed"):
     """``soft`` moves the branch only, ``mixed`` also resets the index, ``hard`` the work tree as well. Returns ``(new commit id, its subject)``."""
     if mode not in ("soft", "mixed", "hard"):
         raise GitError(f"unknown reset mode '{mode}'")
+    from .merge import clear_merge_state, merge_in_progress
+    if mode == "soft" and merge_in_progress(repo):
+        raise GitError("cannot do a soft reset in the middle of a merge")
     new_oid = repo.commit_of(target)
     head_oid = repo.refs.head_oid()
     new_files = snapshot_of_commit(repo, new_oid)
@@ -259,6 +265,7 @@ def reset(repo, target="HEAD", mode="mixed"):
     if head_oid:
         repo.refs._write_locked("ORIG_HEAD", head_oid)
     repo._advance_head(new_oid, head_oid, "reset: moving to %s" % target)
+    clear_merge_state(repo)                                  # a hard or mixed reset ends a merge in progress
     return new_oid, repo.read_commit(new_oid).subject
 
 
@@ -284,4 +291,19 @@ def restore(repo, specs, prefix="", source=None):
     if missing:
         raise GitError(f"pathspec '{missing[0]}' did not match any file(s) known to git")
     repo.write_index(index)
+    return done
+
+
+def restore_stage(repo, specs, prefix, stage):
+    """``checkout --ours/--theirs <paths>``: write the version of an unmerged path from stage 2 (ours) or 3 (theirs) to the work tree, leaving the index conflicted."""
+    from .repo import Pathspec
+    index = repo.read_index()
+    ps = Pathspec(specs, prefix)
+    done = []
+    for (path, st), entry in sorted(index.entries.items(), key=lambda kv: kv[0][0].encode("utf-8", "surrogateescape")):
+        if st == stage and ps.match(path):
+            write_worktree_file(repo, path, entry.mode, repo.odb.read(entry.oid)[1])
+            done.append(path)
+    if not done or ps.unmatched():
+        raise GitError("path '%s' does not have the %s version" % ((ps.unmatched() or specs)[0], "our" if stage == 2 else "their"))
     return done

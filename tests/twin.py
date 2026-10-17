@@ -96,9 +96,9 @@ class Twin:
         args = ["rm", "-q"] + (["--cached"] if cached else []) + (["-f"] if force else []) + (["-r"] if recursive else []) + ["--"] + list(specs)
         return self.both(lambda: self.ours.rm(list(specs), cached=cached, force=force, recursive=recursive), *args)
 
-    def commit(self, message, allow_empty=False, amend=False):
-        args = ["commit", "-q", "-m", message] + (["--allow-empty"] if allow_empty else []) + (["--amend"] if amend else [])
-        return self.both(lambda: self.ours.commit(message, amend=amend, allow_empty=allow_empty), *args)
+    def commit(self, message, allow_empty=False, amend=False, no_edit=False):
+        args = ["commit", "-q"] + (["--no-edit"] if no_edit else ["-m", message]) + (["--allow-empty"] if allow_empty else []) + (["--amend"] if amend else [])
+        return self.both(lambda: self.ours.commit(None if no_edit else message, amend=amend, allow_empty=allow_empty), *args)
 
     def checkout(self, target, create=None, detach=False):
         args = ["checkout", "-q"] + (["-b", create] if create else []) + (["--detach"] if detach else []) + [target]
@@ -119,14 +119,18 @@ class Twin:
 
     def merge(self, spec, ff="allow"):
         flags = {"allow": [], "never": ["--no-ff"], "only": ["--ff-only"]}[ff]
-        ok = self.both(lambda: mg.merge(self.ours, spec, ff=ff), "-c", "merge.renames=false", "-c", "diff.renames=false", "merge", "-q", "--no-edit", *flags, spec)
-        if not ok[1] and os.path.exists(os.path.join(self.theirs_dir, ".git", "MERGE_HEAD")):
-            go.git(self.theirs_dir, "merge", "--abort", check=False)           # real git leaves conflicts in the work tree; ours refuses and leaves nothing behind
-            log = os.path.join(self.theirs_dir, ".git", "logs", "HEAD")        # (the abort is a reset that git logs; ours made no move at all)
-            lines = open(log).read().splitlines(True)
-            if lines and lines[-1].rstrip().endswith("reset: moving to HEAD"):
-                open(log, "w").write("".join(lines[:-1]))
-        return ok
+
+        def ours_merge():
+            if mg.merge(self.ours, spec, ff=ff).kind == "conflict":
+                raise GitError("conflict")                       # the repository now holds the conflicted merge, exactly as after git's failed merge
+
+        return self.both(ours_merge, "-c", "merge.renames=false", "-c", "diff.renames=false", "merge", "-q", "--no-edit", *flags, spec)
+
+    def merge_abort(self):
+        return self.both(lambda: mg.abort(self.ours), "merge", "--abort")
+
+    def in_merge(self):
+        return os.path.exists(os.path.join(self.theirs_dir, ".git", "MERGE_HEAD"))
 
     # --- comparisons -------------------------------------------------------------------------------------------------------------------------
     @staticmethod
@@ -183,6 +187,11 @@ class Twin:
 
     def assert_same(self, label="", worktree=True):
         assert self.refs_of(self.ours_dir) == self.refs_of(self.theirs_dir), f"refs differ {label}: {self.refs_of(self.ours_dir)} vs {self.refs_of(self.theirs_dir)}"
+        for name in ("MERGE_HEAD", "MERGE_MSG", "MERGE_MODE"):
+            paths = [os.path.join(d, ".git", name) for d in (self.ours_dir, self.theirs_dir)]
+            assert [os.path.exists(p) for p in paths][0] == [os.path.exists(p) for p in paths][1], f"{name} exists on one side only {label}"
+            if os.path.exists(paths[0]):
+                assert open(paths[0], "rb").read() == open(paths[1], "rb").read(), f"{name} differs {label}"
         ours_logs, theirs_logs = self.logs_of(self.ours_dir), self.logs_of(self.theirs_dir)
         if ours_logs != theirs_logs:
             import difflib
@@ -339,6 +348,20 @@ def workflow_merge(twin, rng, check):
             steps.append(_same(twin.add("."), "add .", twin))
     steps.append(_same(twin.merge(other, ff=rng.choice(["allow", "allow", "never", "only"])), f"merge {other}", twin))
     check(steps)
+    if twin.in_merge():                                                       # a conflicted merge: abort it, or resolve every path and conclude it
+        how = rng.random()
+        if how < 0.3:
+            steps.append(_same(twin.merge_abort(), "merge --abort", twin))
+        else:
+            for line in go.gits(twin.theirs_dir, "ls-files", "-u").splitlines():
+                name = line.split("\t", 1)[1]
+                if rng.random() < 0.15:
+                    twin.delete(name)
+                else:
+                    twin.write(name, b"resolved by hand %d\n" % rng.randrange(1000))
+            steps.append(_same(twin.add("."), "add . (resolve)", twin))
+            steps.append(_same(twin.commit("conclude", no_edit=how < 0.65), "commit (conclude merge)", twin))
+        check(steps)
     return steps
 
 

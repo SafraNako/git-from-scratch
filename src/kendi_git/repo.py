@@ -709,7 +709,23 @@ class Repo:
         head = self.refs.head_oid()
         parents = [head] if head else []
         author = None
-        if amend:
+        merge_head = None
+        merge_head_path = os.path.join(self.gitdir, "MERGE_HEAD")
+        if os.path.exists(merge_head_path):                         # concluding a merge: the second parent and the prepared message
+            if amend:
+                raise GitError("you are in the middle of a merge: cannot amend")
+            with open(merge_head_path) as f:
+                merge_head = f.read().strip()
+            parents = [head, merge_head]
+            if message is None:
+                try:
+                    with open(os.path.join(self.gitdir, "MERGE_MSG"), encoding="utf-8", errors="surrogateescape") as f:
+                        message = f.read()
+                except FileNotFoundError:
+                    pass
+        if merge_head:
+            pass
+        elif amend:
             if not head:
                 raise GitError("you have nothing to amend")
             old = self.read_commit(head)
@@ -726,8 +742,11 @@ class Repo:
         if message is None:
             raise GitError("a commit message is required (-m)")
         oid = self.make_commit(tree, parents, message, author=author)
-        kind = "commit (amend)" if amend else "commit (initial)" if head is None else "commit"
+        kind = "commit (amend)" if amend else "commit (merge)" if merge_head else "commit (initial)" if head is None else "commit"
         self._advance_head(oid, head, "%s: %s" % (kind, clean_message(message).split("\n")[0]))
+        if merge_head:
+            from .merge import clear_merge_state
+            clear_merge_state(self)
         return oid
 
     def _advance_head(self, oid, old, message=None):

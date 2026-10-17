@@ -97,6 +97,7 @@ def build_parser():
     c.add_argument("-z", action="store_true")
     c.add_argument("-o", "--others", action="store_true")
     c.add_argument("--exclude-standard", action="store_true")
+    c.add_argument("-u", "--unmerged", action="store_true")
     c.add_argument("--full-name", action="store_true", help="print paths relative to the repository root even from a subdirectory")
 
     cmd("write-tree", help="write the index as tree objects")
@@ -133,6 +134,7 @@ def build_parser():
     c.add_argument("-m", "--message", action="append", dest="messages")
     c.add_argument("-a", "--all", action="store_true")
     c.add_argument("--amend", action="store_true")
+    c.add_argument("--no-edit", action="store_true")
     c.add_argument("--allow-empty", action="store_true")
 
     c = cmd("log", help="show the history")
@@ -170,6 +172,8 @@ def build_parser():
     c = cmd("checkout", help="switch branches or restore files")
     c.add_argument("-b", dest="create")
     c.add_argument("--detach", action="store_true")
+    c.add_argument("--ours", action="store_true")
+    c.add_argument("--theirs", action="store_true")
     c.add_argument("args", nargs="*")
 
     c = cmd("reset", help="move the current branch (and optionally the index and work tree)")
@@ -189,8 +193,10 @@ def build_parser():
     c = cmd("merge", help="merge a branch into the current one")
     c.add_argument("--no-ff", action="store_true")
     c.add_argument("--ff-only", action="store_true")
+    c.add_argument("--abort", action="store_true")
+    c.add_argument("--continue", action="store_true", dest="continue_")
     c.add_argument("-m", dest="message")
-    c.add_argument("target")
+    c.add_argument("target", nargs="?")
 
     c = cmd("reflog", help="show the reference log (where a branch or HEAD has been)")
     c.add_argument("-n", "--max-count", type=int)
@@ -366,10 +372,10 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
                     out.write((shown(p) if ns.z else df.quote_path(shown(p))) + sep)
             return 0
         for e in sorted(index.entries.values(), key=ix.IndexEntry.key):
-            if not here(e.path):
+            if not here(e.path) or (ns.unmerged and e.stage == 0):
                 continue
             path = shown(e.path) if ns.z else df.quote_path(shown(e.path))
-            out.write(("%06o %s %d\t%s" % (e.mode, e.oid, e.stage, path) if ns.stage else path) + sep)
+            out.write(("%06o %s %d\t%s" % (e.mode, e.oid, e.stage, path) if (ns.stage or ns.unmerged) else path) + sep)
         return 0
     if cmd == "write-tree":
         out.line(ix.index_to_tree(repo.odb, repo.read_index()))
@@ -422,8 +428,8 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
             print_long_status(repo, status, out, repo.rel_cwd(cwd))
         return 0
     if cmd == "commit":
-        if not ns.messages and not ns.amend:
-            raise GitError("a commit message is required: use -m \"message\" (no editor is started)")
+        if not ns.messages and not ns.amend and not (mg.merge_in_progress(repo) and getattr(ns, "no_edit", False)):
+            raise GitError("a commit message is required: use -m \"message\" (no editor is started)" + (", or --no-edit to take the prepared merge message" if mg.merge_in_progress(repo) else ""))
         message = "\n\n".join(ns.messages) if ns.messages else None
         if ns.all:
             repo.add(["."], prefix="", update=True)
@@ -541,6 +547,11 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
         return 0
     if cmd == "checkout":
         prefix = repo.rel_cwd(cwd)
+        if ns.ours or ns.theirs:
+            paths = ns.after + ns.args if not ns.dashdash else ns.after
+            for p in co.restore_stage(repo, paths, prefix, 2 if ns.ours else 3):
+                out.line("geri yüklendi: " + p)
+            return 0
         if ns.dashdash:
             if len(ns.args) > 1 or not ns.after:
                 raise GitError("usage: kgit checkout [<revision>] -- <path>...")
@@ -576,11 +587,19 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
         return 0
     if cmd == "merge":
         ff = "never" if ns.no_ff else "only" if ns.ff_only else "allow"
-        try:
-            result = mg.merge(repo, ns.target, message=ns.message, ff=ff)
-        except mg.MergeConflict as exc:
-            err.line("kgit: birleştirme çakışması: " + ", ".join(exc.conflicts))
-            err.line("Hiçbir şey değiştirilmedi. Çakışmaları elle çöz ya da dalları farklı yolla birleştir.")
+        if ns.abort:
+            mg.abort(repo)
+            out.line("Birleştirme iptal edildi; HEAD'in durumu geri yüklendi.")
+            return 0
+        if ns.continue_:
+            return run(argparse.Namespace(command="commit", messages=None, all=False, amend=False, allow_empty=False, no_edit=True), repo_factory, out, err, env, cwd, now)
+        if not ns.target:
+            raise GitError("usage: kgit merge [--no-ff|--ff-only] <revision>  |  kgit merge --abort  |  kgit merge --continue")
+        result = mg.merge(repo, ns.target, message=ns.message, ff=ff)
+        if result.kind == "conflict":
+            for kind, path, text in result.notes:
+                out.line(("Otomatik birleştirme: " + path) if kind == "auto" else ("ÇAKIŞMA: " + text))
+            err.line("Otomatik birleştirme başarısız; çakışmaları düzelt, 'kgit add' ile hazırla ve 'kgit commit' ile sonuçlandır (vazgeçmek için 'kgit merge --abort').")
             return 1
         if result.kind == "up-to-date":
             out.line("Zaten güncel.")

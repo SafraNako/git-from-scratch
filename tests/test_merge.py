@@ -201,7 +201,7 @@ def test_merge_command_matches_git_for_a_clean_merge(tmp_path):
     pytest.fail("no clean scenario found")
 
 
-def test_conflicted_merge_changes_nothing(tmp_path):
+def test_a_conflicted_merge_leaves_markers_and_can_be_aborted(tmp_path):
     repo = str(tmp_path / "r")
     os.makedirs(repo)
     go.git(repo, "init", "-q", "-b", "main")
@@ -215,13 +215,15 @@ def test_conflicted_merge_changes_nothing(tmp_path):
     go.write(repo, "f.txt", "one\nMAIN\nthree\n")
     go.git(repo, "commit", "-qam", "main", extra=go.commit_env(3))
     ours = Repo(os.path.join(repo, ".git"), repo, env=go.env())
-    before = (open(os.path.join(repo, "f.txt")).read(), go.gits(repo, "rev-parse", "HEAD"), go.gits(repo, "status", "--porcelain"))
-    with pytest.raises(mg.MergeConflict) as exc:
-        mg.merge(ours, "side")
-    assert exc.value.conflicts == ["f.txt"]
-    assert (open(os.path.join(repo, "f.txt")).read(), go.gits(repo, "rev-parse", "HEAD"), go.gits(repo, "status", "--porcelain")) == before
-    assert not os.path.exists(os.path.join(repo, ".git", "MERGE_HEAD"))
-    assert go.git(repo, "merge", "side", check=False).returncode != 0                                # git agrees that this is a conflict
+    head = go.gits(repo, "rev-parse", "HEAD")
+    result = mg.merge(ours, "side")
+    assert result.kind == "conflict" and [c.path for c in result.conflicts] == ["f.txt"]
+    assert open(os.path.join(repo, "f.txt")).read() == "one\n<<<<<<< HEAD\nMAIN\n=======\nSIDE\n>>>>>>> side\nthree\n"
+    assert go.gits(repo, "status", "--porcelain").strip() == "UU f.txt" and go.gits(repo, "rev-parse", "HEAD") == head
+    assert go.gits(repo, "rev-parse", "MERGE_HEAD").strip() == go.gits(repo, "rev-parse", "side").strip()
+    mg.abort(ours)
+    assert open(os.path.join(repo, "f.txt")).read() == "one\nMAIN\nthree\n" and go.gits(repo, "status", "--porcelain") == ""
+    assert not mg.merge_in_progress(ours)
 
 
 def test_refusals(tmp_path):
@@ -251,3 +253,34 @@ def test_refusals(tmp_path):
 def test_split_lines_roundtrip_used_by_the_merge():
     data = b"a\nb\n\nc"
     assert b"".join(split_lines(data)) == data
+
+
+def merge_file_with_markers(tmp_path, base, ours, theirs):
+    paths = []
+    for name, data in (("ours", ours), ("base", base), ("theirs", theirs)):
+        p = str(tmp_path / name)
+        open(p, "wb").write(data)
+        paths.append(p)
+    proc = go.git(str(tmp_path), "merge-file", "-p", "-L", "mine", "-L", "orig", "-L", "other", *paths, check=False)
+    return min(proc.returncode, 127), proc.stdout
+
+
+@pytest.mark.parametrize("flavour", ["distinct", "repetitive", "crlf-and-no-final-newline"])
+def test_conflict_markers_are_written_exactly_like_git_merge_file(tmp_path, flavour):
+    rng = random.Random({"distinct": 11, "repetitive": 12, "crlf-and-no-final-newline": 13}[flavour])
+    conflicted = 0
+    for _ in range(250):
+        n = rng.randint(0, 30)
+        base = lines_of(rng, n, unique=flavour == "distinct", alphabet=4)
+        ours, theirs = edit_lines(rng, base, rng.randint(0, 4)), edit_lines(rng, base, rng.randint(0, 4))
+        if flavour.startswith("crlf"):
+            fix = lambda ls: [ln[:-1] + b"\r\n" if ln.endswith(b"\n") and rng.random() < 0.9 else ln for ln in ls]  # noqa: E731
+            base, ours, theirs = fix(base), fix(ours), fix(theirs)
+            for side in (base, ours, theirs):
+                if side and rng.random() < 0.3:
+                    side[-1] = side[-1].rstrip(b"\r\n")
+        code, expected = merge_file_with_markers(tmp_path, b"".join(base), b"".join(ours), b"".join(theirs))
+        lines, conflicts = mg.xdl_merge(base, ours, theirs, "mine", "other", level=mg.MERGE_ZEALOUS_ALNUM)
+        assert (conflicts, b"".join(lines)) == (code, expected), (flavour, base, ours, theirs)
+        conflicted += bool(code)
+    assert conflicted > 40
