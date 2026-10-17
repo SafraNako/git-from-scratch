@@ -191,7 +191,8 @@ class Twin:
                 lines += [f"[{name}] {ln[:2]} {ln[2:][:160]}" for ln in difflib.unified_diff(theirs_logs.get(name, "").splitlines(), ours_logs.get(name, "").splitlines(), "git", "ours", lineterm="", n=0)
                           if not ln.startswith(("---", "+++", "@@"))]
             raise AssertionError(f"reflogs differ {label} (- git, + ours): " + " | ".join(lines[:6]) + " || git config: " + go.gits(self.theirs_dir, "config", "--local", "--list").replace("\n", ";")
-                                 + " || git dir: " + str(sorted(os.listdir(os.path.join(self.theirs_dir, ".git")))))
+                                 + " || git logs: " + str([(r, f, os.path.getsize(os.path.join(r, f))) for r, _d, fs in os.walk(os.path.join(self.theirs_dir, ".git", "logs")) for f in fs])
+                                 + " || head log: " + repr(open(os.path.join(self.theirs_dir, ".git", "logs", "HEAD")).read()[:300]))
         if worktree:
             ours_tree, theirs_tree = self.tree_snapshot(self.ours_dir), self.tree_snapshot(self.theirs_dir)
             # empty directories are not tracked by git: the two sides may keep different leftovers
