@@ -335,7 +335,7 @@ def test_renaming_and_removing_the_remote_that_a_clone_follows(rt):
     rt.clone()
     g, k = rt.both("remote", "rename", "origin", "upstream")
     assert g[0] == k[0] == 0, (g, k)
-    rt.assert_same("after renaming origin")
+    rt.assert_same("after renaming origin", logs=go.GIT_VERSION < (2, 40, 0))        # what newer git writes into the reflogs of a renamed remote is different again
     g, k = rt.both("remote", "remove", "upstream")
     assert g[0] == k[0] == 0, (g, k)
-    rt.assert_same("after removing the remote")
+    rt.assert_same("after removing the remote", logs=go.GIT_VERSION < (2, 40, 0))

@@ -60,7 +60,7 @@ As a library: `from kendi_git.repo import Repo` (see [`examples/walkthrough.py`]
 
 ## How it was validated
 
-The ground rule of this project: **a behaviour is only believed once real git has agreed with it.** The suite has 400 tests; the bulk of them run both programs on the
+The ground rule of this project: **a behaviour is only believed once real git has agreed with it.** The suite has 404 tests; the bulk of them run both programs on the
 same input and compare the answers.
 
 | Component | Compared with git on |
