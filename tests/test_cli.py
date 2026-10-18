@@ -26,8 +26,15 @@ def copy(history_repo, tmp_path):
     return path
 
 
+def with_renames_off(ours, git_args):
+    """The oracle is run with --no-renames wherever the test compares plain output; ours gets the same switch."""
+    if "--no-renames" in git_args and ours and ours[0] in ("status", "diff", "show", "log") and "--no-renames" not in ours:
+        return list(ours) + ["--no-renames"]
+    return ours
+
+
 def same_as_git(repo, ours, *git_args):
-    code, out, err = kgit(repo, *ours)
+    code, out, err = kgit(repo, *with_renames_off(ours, git_args))
     theirs = go.git(repo, *git_args)
     assert code == 0, err
     assert out == theirs, (ours, out[:300], theirs[:300])
@@ -234,7 +241,7 @@ def test_commands_run_from_a_subdirectory_behave_like_git(tmp_path):
     sub = os.path.join(repo, "src")
 
     def same(ours, *theirs):
-        code, out, err = kgit(sub, *ours)
+        code, out, err = kgit(sub, *with_renames_off(ours, theirs))
         assert code == 0, err
         assert out == go.git(sub, *theirs), (ours, out, go.git(sub, *theirs))
 

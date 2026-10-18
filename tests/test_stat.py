@@ -24,12 +24,12 @@ def test_stat_forms_match_git_on_random_changes(tmp_path, seed):
     repo, rng = setup(tmp_path, seed)
     mutate_worktree(repo, rng)
     for flags in (["--stat"], ["--shortstat"], ["--summary"], ["--stat", "--summary"]):
-        assert kgit(repo, "diff", *flags) == go.git(repo, "diff", "--no-renames", *flags), flags
+        assert kgit(repo, "diff", "--no-renames", *flags) == go.git(repo, "diff", "--no-renames", *flags), flags
     go.git(repo, "add", "-A")
     for flags in (["--stat"], ["--shortstat"], ["--summary"]):
-        assert kgit(repo, "diff", "--cached", *flags) == go.git(repo, "diff", "--cached", "--no-renames", *flags), flags
+        assert kgit(repo, "diff", "--cached", "--no-renames", *flags) == go.git(repo, "diff", "--cached", "--no-renames", *flags), flags
     go.git(repo, "commit", "-qm", "two", extra=go.commit_env(2))
-    assert kgit(repo, "diff", "HEAD~1", "HEAD", "--stat") == go.git(repo, "diff", "--no-renames", "--stat", "HEAD~1", "HEAD")
+    assert kgit(repo, "diff", "--no-renames", "HEAD~1", "HEAD", "--stat") == go.git(repo, "diff", "--no-renames", "--stat", "HEAD~1", "HEAD")
 
 
 def test_wide_graphs_and_long_names_are_scaled_like_git(tmp_path):

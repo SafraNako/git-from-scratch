@@ -39,6 +39,29 @@ def write_pack(objects):
     return blob + hashlib.sha1(blob).digest()
 
 
+def iter_pack(entries, read, raw_delta=None):
+    """The bytes of a pack holding the objects ``entries`` (``[(kind, oid)]``), in pieces; ``read(oid)`` gives ``(kind, data)``. With ``raw_delta(oid)`` (see
+    ``ObjectDB.raw_delta``) an object that the repository stores as a delta against another object of the pack is copied as that delta instead of in full."""
+    sha = hashlib.sha1()
+    head = b"PACK" + struct.pack(">II", 2, len(entries))
+    sha.update(head)
+    yield head
+    sent = {oid for _k, oid in entries} if raw_delta else ()
+    for _kind, oid in entries:
+        piece = None
+        if raw_delta:
+            found = raw_delta(oid)
+            if found is not None and found[0] in sent:
+                base, size, compressed = found
+                piece = _object_header(REF_DELTA, size) + bytes.fromhex(base) + compressed
+        if piece is None:
+            kind, data = read(oid)
+            piece = _object_header(TYPE_CODES[kind], len(data)) + zlib.compress(data, 1)
+        sha.update(piece)
+        yield piece
+    yield sha.digest()
+
+
 class _Entry:
     __slots__ = ("offset", "end", "code", "size", "base_offset", "base_oid", "crc", "oid", "kind")
 
@@ -241,4 +264,4 @@ def receive_pack(chunks, odb, objects_dir, expected=None):
             os.unlink(tmp)
 
 
-__all__ = ["write_pack", "receive_pack"]
+__all__ = ["write_pack", "iter_pack", "receive_pack"]

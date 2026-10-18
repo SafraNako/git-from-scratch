@@ -122,6 +122,10 @@ def build_parser():
     c.add_argument("-v", "--verbose", action="store_true")
     c.add_argument("paths", nargs="*")
 
+    c = cmd("mv", help="move or rename a file or directory")
+    c.add_argument("-f", "--force", action="store_true")
+    c.add_argument("paths", nargs="+")
+
     c = cmd("rm", help="remove files from the index and the work tree")
     c.add_argument("--cached", action="store_true")
     c.add_argument("-f", "--force", action="store_true")
@@ -133,6 +137,7 @@ def build_parser():
     c.add_argument("--porcelain", action="store_true")
     c.add_argument("-z", action="store_true")
     c.add_argument("-b", "--branch", action="store_true", help="with --short, show the branch line")
+    c.add_argument("--no-renames", action="store_true")
     c.add_argument("-u", "--untracked-files", nargs="?", const="all", default="normal", choices=["no", "normal", "all"], dest="untracked")
 
     c = cmd("commit", help="record the staged changes")
@@ -151,6 +156,7 @@ def build_parser():
     c.add_argument("--date-order", action="store_true")
     c.add_argument("--full-history", action="store_true")
     c.add_argument("--first-parent", action="store_true")
+    c.add_argument("--follow", action="store_true")
     c.add_argument("-p", "--patch", action="store_true")
     c.add_argument("-c", dest="combined", action="store_true")
     c.add_argument("--cc", action="store_true")
@@ -185,6 +191,7 @@ def build_parser():
     c.add_argument("args", nargs="*")
 
     c = cmd("clone", help="clone a repository into a new directory")
+    c.add_argument("-q", "--quiet", action="store_true")
     c.add_argument("--bare", action="store_true")
     c.add_argument("-b", "--branch")
     c.add_argument("-o", "--origin", default="origin")
@@ -193,6 +200,7 @@ def build_parser():
     c.add_argument("directory", nargs="?")
 
     c = cmd("fetch", help="download objects and refs from another repository")
+    c.add_argument("-q", "--quiet", action="store_true")
     c.add_argument("--prune", "-p", action="store_true")
     c.add_argument("--tags", "-t", action="store_true")
     c.add_argument("--no-tags", action="store_true")
@@ -201,6 +209,9 @@ def build_parser():
     c.add_argument("args", nargs="*")
 
     c = cmd("pull", help="fetch and merge")
+    c.add_argument("-q", "--quiet", action="store_true")
+    c.add_argument("--no-rebase", action="store_true")
+    c.add_argument("--rebase", action="store_true")
     c.add_argument("--ff-only", action="store_true")
     c.add_argument("--no-ff", action="store_true")
     c.add_argument("--prune", "-p", action="store_true")
@@ -208,6 +219,7 @@ def build_parser():
     c.add_argument("args", nargs="*")
 
     c = cmd("push", help="send objects and refs to another repository")
+    c.add_argument("-q", "--quiet", action="store_true")
     c.add_argument("-u", "--set-upstream", action="store_true")
     c.add_argument("-f", "--force", action="store_true")
     c.add_argument("-d", "--delete", action="store_true")
@@ -232,6 +244,11 @@ def build_parser():
     c.add_argument("-D", action="store_true", dest="force_delete")
     c.add_argument("-m", "--move", action="store_true")
     c.add_argument("-f", "--force", action="store_true")
+    c.add_argument("-v", "--verbose", action="count", default=0)
+    c.add_argument("-r", "--remotes", action="store_true")
+    c.add_argument("-a", "--all", action="store_true")
+    c.add_argument("-u", "--set-upstream-to", dest="set_upstream_to")
+    c.add_argument("--unset-upstream", action="store_true")
     c.add_argument("names", nargs="*")
 
     c = cmd("checkout", help="switch branches or restore files")
@@ -304,6 +321,21 @@ def _tree_lines(repo, oid, recursive=False, names_only=False, prefix="", quote=T
 def print_long_status(repo, status, out, prefix=""):
     branch = status.branch
     out.line("Dal: %s" % branch if branch else "HEAD ayrık (detached): %s" % (status.head or "")[:7])
+    if status.upstream:
+        up, ahead, behind, gone = status.upstream
+        if gone:
+            out.line("Dalınız '%s' tabanlı, ancak uzak dal artık yok." % up)
+        elif ahead and behind:
+            out.line("Dalınız ve '%s' ayrışmış (diverged); sırasıyla %d ve %d farklı commit var." % (up, ahead, behind))
+            out.line("  ('kgit pull' ile uzak dalı kendi dalına birleştir)")
+        elif ahead:
+            out.line("Dalınız '%s' dalının %d commit önünde." % (up, ahead))
+            out.line("  ('kgit push' ile yerel commit'lerini yayımla)")
+        elif behind:
+            out.line("Dalınız '%s' dalının %d commit gerisinde; ileri sarılabilir (fast-forward)." % (up, behind))
+            out.line("  ('kgit pull' ile yerel dalı güncelle)")
+        else:
+            out.line("Dalınız '%s' ile güncel." % up)
     if status.head is None:
         out.line("")
         out.line("Henüz commit yok")
@@ -381,6 +413,63 @@ def _print_merge(repo, result, out, err):
     return 0
 
 
+def _set_upstream_to(repo, branch, target, out):
+    """``branch -u <upstream>``: the upstream is a remote-tracking branch (``origin/main``) or a local branch."""
+    for cand in ("refs/remotes/" + target, "refs/heads/" + target, target):
+        if cand.startswith("refs/") and repo.refs.exists(cand):
+            break
+    else:
+        raise GitError("the requested upstream branch '%s' does not exist" % target)
+    if cand.startswith("refs/heads/"):
+        rm.set_upstream(repo, branch, ".", cand)
+        out.line("branch '%s' set up to track '%s'." % (branch, cand[len("refs/heads/"):]))
+        return
+    rest = cand[len("refs/remotes/"):]
+    for remote in rm.remote_names(repo):
+        if rest.startswith(remote + "/"):
+            for spec in rm.remote_fetch_specs(repo, remote):
+                mid = rm.match_pattern(spec.dst, cand) if spec.dst else None
+                if mid is not None:
+                    rm.set_upstream(repo, branch, remote, spec.src.replace("*", mid))
+                    out.line("branch '%s' set up to track '%s'." % (branch, rest))
+                    return
+    raise GitError("the requested upstream branch '%s' does not exist" % target)
+
+
+def _list_branches(repo, ns, out):
+    current = repo.refs.current_branch()
+    rows = []
+    if not ns.remotes:
+        rows += [("", n, oid) for n, oid in repo.branches()]
+    if ns.remotes or ns.all:
+        for ref, oid in repo.refs.list("refs/remotes/"):
+            raw = repo.refs.read_raw(ref)
+            name = ref[len("refs/remotes/"):]
+            if raw and raw[0] == "sym":
+                rows.append(("remotes/" if ns.all else "", name + " -> " + raw[1][len("refs/remotes/"):], oid))
+            else:
+                rows.append(("remotes/" if ns.all else "", name, oid))
+    width = max([len(p + n) for p, n, _o in rows if " -> " not in n] + [0])
+    for prefix, name, oid in rows:
+        mark = "* " if (not prefix and name == current) else "  "
+        label = prefix + name
+        if not ns.verbose or " -> " in name:
+            out.line(mark + label)
+            continue
+        c = repo.read_commit(oid)
+        extra = ""
+        if not prefix:
+            state = repo.upstream_state(name, oid)
+            if state:
+                up, ahead, behind, gone = state
+                detail = "gone" if gone else ", ".join(([("ahead %d" % ahead)] if ahead else []) + ([("behind %d" % behind)] if behind else []))
+                if ns.verbose > 1:
+                    extra = "[%s%s] " % (up, ": " + detail if detail else "")
+                elif detail:
+                    extra = "[%s] " % detail                      # a single -v shows the counts without naming the upstream
+        out.line("%s%s %s %s%s" % (mark, label.ljust(width), repo.odb.abbrev(oid), extra, c.subject))
+
+
 def _remote_command(ns, repo, out):
     action = ns.action
     if action is None:
@@ -420,10 +509,13 @@ def _remote_command(ns, repo, out):
 
 
 def _pull(ns, repo, out, err):
+    if ns.rebase:
+        raise GitError("pull --rebase is not supported (there is no rebase); use the default merge")
     cur = repo.refs.current_branch()
     res = rm.fetch(repo, ns.remote, ns.refspecs, prune=ns.prune, tags=True if ns.tags else None, action=" ".join(["pull"] + list(ns.argv_tail)))
     for line in res.lines:
-        err.line(line)
+        if not ns.quiet:
+            err.line(line)
     heads = [h for h in res.fetch_head if h[1]]
     if not heads:
         if cur is None:
@@ -470,6 +562,58 @@ def _log_revisions(repo, tokens, dashdash):
     return pending, tokens[i:]
 
 
+def _log_follow(ns, repo, pending, path, out):
+    """``log --follow <file>``: every commit is looked at (no history simplification); one is shown when its change against its parent touches the file, and a commit
+    that creates the file as a rename or copy of another one moves the search to the old name for the commits behind it."""
+    walk = hist.Walk(repo, pending, None, first_parent=ns.first_parent, topo=("date" if ns.date_order else "topo") if (ns.topo_order or ns.date_order) else None)
+    commits = walk.run()
+    threshold = _rename_threshold(ns)
+    first, shown, current = True, 0, path
+    for oid in commits:
+        parents = repo.read_commit(oid).parents
+        if len(parents) > 1:
+            continue
+        parent = parents[0] if parents else None
+        changes = repo.changes_commits(parent, oid, Pathspec([current]))
+        switch = None
+        if len(changes) == 1 and changes[0][1] is None and changes[0][0] == current and threshold is not None and parent is not None:
+            new_side = changes[0][2]
+            if new_side.mode in (0o100644, 0o100755):
+                parent_files, current_files = repo.tree_files(repo.read_commit(parent).tree), repo.tree_files(repo.read_commit(oid).tree)
+                found = rn.find_follow_source(parent_files, current_files, current, new_side, lambda m, o: df.blob_side(m, o, repo.odb), threshold)
+                if found:
+                    src, score = found
+                    old_mode, old_oid = parent_files[src]
+                    still_there = src in current_files
+                    changes = [(current, df.RenamedSide(old_mode, old_oid, df.blob_side(old_mode, old_oid, repo.odb).data, src, score, still_there), new_side)]
+                    switch = src
+        if not changes:
+            continue
+        if ns.max_count is not None and shown >= ns.max_count:
+            break
+        shown += 1
+        extra = []
+        if ns.stat:
+            extra.append(df.format_stat(changes).encode("utf-8", "surrogateescape"))
+        if ns.patch or ns.combined or ns.cc:
+            extra.append(repo.render_changes(changes, ns.context))
+        extra = [e for e in extra if e]
+        body = (b"\n".join(extra)).decode("utf-8", "surrogateescape").rstrip("\n").split("\n") if extra else []
+        lines = ([] if ns.oneline else ["---" if len(extra) == 2 else ""]) + body if body else []
+        if ns.oneline:
+            out.line(repo.format_commit(oid, oneline=True))
+        else:
+            if not first:
+                out.line("")
+            out.write(repo.format_commit(oid))
+        for line in lines:
+            out.line(line)
+        first = False
+        if switch:
+            current = switch
+    return 0
+
+
 def _cmd_log(ns, repo, out, cwd):
     pending, rest = _log_revisions(repo, ns.revs, ns.dashdash)
     paths = ns.after + rest
@@ -478,6 +622,12 @@ def _cmd_log(ns, repo, out, cwd):
     if all(u for _o, u, _b in pending):
         raise GitError("no revision to start from")
     ps = Pathspec(paths, repo.rel_cwd(cwd)) if paths else None
+    if ns.follow:
+        if len(paths) != 1 or ps is None or not ps.items[0][2] or not ps.items[0][1]:
+            raise GitError("--follow requires exactly one plain file path")
+        if ns.graph:
+            raise GitError("--follow cannot be combined with --graph")
+        return _log_follow(ns, repo, pending, ps.items[0][1], out)
     ordered = ns.graph or ns.topo_order or ns.date_order                  # these orders need the whole list first; --graph implies --topo-order
     walk = hist.Walk(repo, pending, ps, full_history=ns.full_history, first_parent=ns.first_parent,
                      topo=("date" if ns.date_order else "topo") if ordered else None, rewrite=ns.graph)
@@ -568,7 +718,8 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
         return checks.run(out, quick=ns.quick)
     if cmd == "clone":
         out_dir = ns.directory or rm.default_dir_name(ns.url) + (".git" if ns.bare else "")
-        err.line("Cloning into %s'%s'..." % ("bare repository " if ns.bare else "", out_dir))
+        if not ns.quiet:
+            err.line("Cloning into %s'%s'..." % ("bare repository " if ns.bare else "", out_dir))
         repo, notes = rm.clone(ns.url, ns.directory, bare=ns.bare, branch=ns.branch, origin=ns.origin, checkout=not ns.no_checkout, env=env, now=now, cwd=cwd)
         for note in notes:
             err.line(note)
@@ -678,6 +829,12 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
             for p in removed:
                 out.line("remove '%s'" % p)
         return 0
+    if cmd == "mv":
+        paths = ns.paths + ns.after
+        if len(paths) < 2:
+            raise GitError("usage: kgit mv <source>... <destination>")
+        repo.mv(paths[:-1], paths[-1], prefix=repo.rel_cwd(cwd), force=ns.force)
+        return 0
     if cmd == "rm":
         paths = ns.paths + ns.after
         if not paths:
@@ -686,7 +843,7 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
             out.line("rm '%s'" % p)
         return 0
     if cmd == "status":
-        status = repo.status(untracked=ns.untracked)
+        status = repo.status(untracked=ns.untracked, renames=not ns.no_renames)
         if ns.porcelain or ns.short:
             if ns.z:
                 for x, y, p in status.entries:
@@ -695,7 +852,12 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
                     out.write("?? %s\0" % p)
             else:
                 if ns.branch:
-                    out.line("## " + ("No commits yet on %s" % status.branch if status.head is None and status.branch else status.branch or "HEAD (no branch)"))
+                    head = "No commits yet on %s" % status.branch if status.head is None and status.branch else status.branch or "HEAD (no branch)"
+                    if status.upstream:
+                        up, ahead, behind, gone = status.upstream
+                        detail = "gone" if gone else ", ".join(([("ahead %d" % ahead)] if ahead else []) + ([("behind %d" % behind)] if behind else []))
+                        head += "...%s%s" % (up, " [%s]" % detail if detail else "")
+                    out.line("## " + head)
                 for line in status.porcelain_lines(prefix="" if ns.porcelain else repo.rel_cwd(cwd)):
                     out.line(line)
         else:
@@ -730,7 +892,7 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
         elif kind == "commit":
             out.write(repo.show_commit(oid, ns.context, dense=not ns.combined or ns.cc, renames=_rename_threshold(ns)))
         elif kind == "tag":
-            out.write(repo.show_tag(oid, ns.context))
+            out.write(repo.show_tag(oid, ns.context, renames=_rename_threshold(ns)))
         elif kind == "tree":
             out.line("tree %s\n" % ns.object)
             for line in _tree_lines(repo, oid, names_only=True):
@@ -802,18 +964,24 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
             res = rm.fetch(repo, name, ns.refspecs, prune=ns.prune, tags=True if ns.tags else False if ns.no_tags else None, force=ns.force,
                            reflog_args=list(ns.argv_tail))
             for line in res.lines:
-                err.line(line)
+                if not ns.quiet:
+                    err.line(line)
         return 0
     if cmd == "pull":
         return _pull(ns, repo, out, err)
     if cmd == "push":
         res = rm.push(repo, ns.remote, ns.refspecs, force=ns.force, delete=ns.delete, set_upstream_flag=ns.set_upstream, all_branches=ns.all, tags=ns.tags, dry_run=ns.dry_run)
+        for line in res.errors:
+            err.line("error: " + line)
         for line in res.lines:
-            err.line(line)
-        if not res.lines and res.up_to_date:
+            if not ns.quiet:
+                err.line(line)
+        if not res.lines and res.up_to_date and not ns.quiet:
             err.line("Everything up-to-date")
         if not res.ok:
-            err.line("error: failed to push some refs")
+            err.line("error: failed to push some refs to '%s'" % res.url)
+            for line in res.hints:
+                err.line("hint: " + line)
             return 1
         return 0
     if cmd == "branch":
@@ -826,12 +994,24 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
             if len(names) == 1:
                 names = [repo.refs.current_branch() or "", names[0]]
             repo.rename_branch(names[0], names[1])
+        elif ns.set_upstream_to or ns.unset_upstream:
+            branch = names[0] if names else repo.refs.current_branch()
+            if branch is None or repo.refs.read("refs/heads/" + branch) is None:
+                raise GitError("branch '%s' does not exist" % (branch or "HEAD"))
+            if ns.unset_upstream:
+                if not rm.upstream_of(repo, branch):
+                    raise GitError("branch '%s' has no upstream information" % branch)
+                repo.config.local.unset("branch.%s.remote" % branch)
+                repo.config.local.unset("branch.%s.merge" % branch)
+                repo.config.local.save()
+            else:
+                _set_upstream_to(repo, branch, ns.set_upstream_to, out)
         elif names:
             repo.create_branch(names[0], names[1] if len(names) > 1 else None, force=ns.force)
         else:
-            current = repo.refs.current_branch()
-            for n, _oid in repo.branches():
-                out.line(("* " if n == current else "  ") + n)
+            _list_branches(repo, ns, out)
+        for note in repo.notes:
+            out.line(note)
         return 0
     if cmd == "checkout":
         prefix = repo.rel_cwd(cwd)
@@ -853,6 +1033,8 @@ def run(ns, repo_factory, out, err, env, cwd, now, stdin=None):
         out.line({"already": "Zaten '%s' dalındasın." % result.name, "branch": "'%s' dalına geçildi." % result.name,
                   "new-branch": "Yeni '%s' dalı oluşturuldu ve ona geçildi." % result.name,
                   "detached": "HEAD ayrık (detached): %s %s" % (repo.odb.abbrev(result.oid), result.subject)}[result.kind])
+        for note in repo.notes:
+            out.line(note)
         return 0
     if cmd == "reset":
         mode = "soft" if ns.soft else "hard" if ns.hard else "mixed"

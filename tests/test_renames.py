@@ -116,3 +116,48 @@ def test_renames_match_git(tmp_path, seed):
         go.write(repo, path, files[path])
     for argv in (["status", "--porcelain"], ["status", "-s"], ["status", "--porcelain", "-z"]):
         assert kgit(repo, *argv) == go.gits(repo, *argv, check=False), (seed, argv, "edited")
+
+
+def history_with_moves(repo, rng, steps=10):
+    """A linear history in which one file keeps being edited, renamed, copied, and replaced by lookalikes."""
+    files = {"main.txt": make_text(rng, 24), "other.txt": make_text(rng, 18)}
+    for p, t in files.items():
+        go.write(repo, p, t)
+    commit_all(repo, "base")
+    current = "main.txt"
+    for k in range(steps):
+        r = rng.random()
+        if r < 0.35:
+            new = rng.choice(DIRS) + rng.choice(NAMES)
+            if new in files:
+                continue
+            os.remove(os.path.join(repo, current))
+            files[new] = mutate(rng, files.pop(current))
+            go.write(repo, new, files[new])
+            current = new
+        elif r < 0.6:
+            new = rng.choice(DIRS) + rng.choice(NAMES)
+            if new in files:
+                continue
+            files[new] = mutate(rng, files[current])                       # a copy: the original stays
+            go.write(repo, new, files[new])
+        else:
+            files[current] = mutate(rng, files[current]) + "tail %d\n" % k
+            go.write(repo, current, files[current])
+        if rng.random() < 0.3:
+            other = rng.choice(sorted(files))
+            files[other] = mutate(rng, files[other]) + "x\n"
+            go.write(repo, other, files[other])
+        commit_all(repo, "step %d" % k)
+    return current
+
+
+@pytest.mark.parametrize("seed", range(int(os.environ.get("KGIT_FOLLOW_SEEDS", "12"))))
+def test_log_follow_matches_git(tmp_path, seed):
+    rng = random.Random(2600 + seed)
+    repo = fresh(tmp_path, "f")
+    current = history_with_moves(repo, rng)
+    for argv in (["log", "--follow", "--oneline", "--", current], ["log", "--follow", "-p", "--", current], ["log", "--follow", "--stat", "--", current],
+                 ["log", "--follow", "-n", "2", "--oneline", "--", current]):
+        theirs = go.gits(repo, argv[0], "--no-decorate", *argv[1:], check=False)
+        assert kgit(repo, *argv) == theirs, (seed, argv)

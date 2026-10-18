@@ -101,6 +101,7 @@ class Status:
     branch: object = None                                # branch name, or None when HEAD is detached
     head: object = None                                  # commit id or None (unborn)
     renames: dict = field(default_factory=dict)          # new path -> old path, for the entries whose X is "R"
+    upstream: object = None                              # (name like origin/main, ahead, behind, gone) for a branch that follows another
 
     def porcelain_lines(self, quote=True, prefix=""):
         """``XY path`` lines. ``prefix`` (the current directory relative to the repository root) makes the paths relative to it, as ``git status -s`` prints them;
@@ -140,6 +141,7 @@ class Repo:
         self.refs = RefStore(self.gitdir, log_all=self.config.get_bool("core.logAllRefUpdates", not self.bare))
         self._commits = {}
         self._shallow = None
+        self.notes = []                                   # messages a command prints after its work ("branch 'x' set up to track ...")
 
     # --- creating and finding ------------------------------------------------------------------------------------------------------------------
     @staticmethod
@@ -297,6 +299,18 @@ class Repo:
 
     def _reflog_selector(self, name, selector, original):
         """Resolve ``name@{selector}`` where the selector is a number (the n-th previous value of the ref) or ``-n`` (the branch checked out n switches ago)."""
+        if selector.lower() in ("u", "upstream", "push"):
+            from . import remote as rm
+            branch = name if name not in ("", "@") else self.refs.current_branch()
+            if branch is None:
+                raise GitError(f"'{original}': HEAD does not point to a branch")
+            up = rm.upstream_of(self, branch)
+            if up is None or not up[2]:
+                raise GitError(f"no upstream configured for branch '{branch}'")
+            oid = self.refs.read(up[2])
+            if oid is None:
+                raise GitError(f"upstream branch '{up[1]}' not stored as a remote-tracking branch")
+            return oid
         if not re.fullmatch(r"-?\d+", selector):
             raise GitError(f"'{original}': only numeric reflog selectors are supported")
         n = int(selector)
@@ -513,7 +527,7 @@ class Repo:
         return sorted(found, key=sort_key)
 
     # --- status ----------------------------------------------------------------------------------------------------------------------------------
-    def status(self, untracked="all"):
+    def status(self, untracked="all", renames=True):
         index = self.read_index()
         head = self.refs.head_oid()
         head_files = self.tree_files(self.read_commit(head).tree) if head else {}
@@ -551,20 +565,38 @@ class Repo:
                 added[path] = e
             if (x, y) != (" ", " "):
                 entries.append((x, y, path))
-        renames = {}
-        if deleted and added:
+        moved = {}
+        if renames and deleted and added:
             changes = [(p, self._blob_side(*h), None) for p, h in deleted.items()] + [(p, None, self._blob_side(e.mode, e.oid)) for p, e in added.items()]
             changes.sort(key=lambda c: sort_key(c[0]))
             for path, old_side, _new in self.detect_renames(changes, rn.DEFAULT_MINIMUM_SCORE):
                 if isinstance(old_side, df.RenamedSide):
-                    renames[path] = old_side.path
-        if renames:
-            gone = set(renames.values())
-            entries = [("R" if p in renames else x, y, p) for x, y, p in entries if not (x == "D" and p in gone)]
-        s = Status(entries=entries, branch=self.refs.current_branch(), head=head, renames=renames)
+                    moved[path] = old_side.path
+        if moved:
+            gone = set(moved.values())
+            entries = [("R" if p in moved else x, y, p) for x, y, p in entries if not (x == "D" and p in gone)]
+        s = Status(entries=entries, branch=self.refs.current_branch(), head=head, renames=moved)
+        s.upstream = self.upstream_state(s.branch, head)
         if untracked != "no":
             s.untracked = self.walk_untracked_candidates(index, collapse=(untracked == "normal"))
         return s
+
+    def upstream_state(self, branch, head):
+        """``(name, ahead, behind, gone)`` for a branch that follows another one, ``None`` if it follows nothing."""
+        if not branch:
+            return None
+        from . import remote as rm
+        up = rm.upstream_of(self, branch)
+        if not up or not up[2]:
+            return None
+        name = up[2][len("refs/remotes/"):] if up[2].startswith("refs/remotes/") else up[2][len("refs/heads/"):] if up[2].startswith("refs/heads/") else up[2]
+        tip = self.refs.read(up[2])
+        if tip is None:
+            return (name, 0, 0, True)
+        if head is None:
+            return (name, 0, len(self.reachable([tip])), False)
+        ahead, behind = rm.ahead_behind(self, head, tip)
+        return (name, ahead, behind, False)
 
     @staticmethod
     def _unmerged_code(stages):
@@ -706,6 +738,57 @@ class Repo:
                 self._prune_empty_dirs(os.path.dirname(path))
         self.write_index(index)
         return matched
+
+    def mv(self, sources, dest, prefix="", force=False):
+        """``git mv``: move tracked files (or directories with tracked files) in the work tree and in the index. Returns ``[(old, new)]``."""
+        index = self.read_index()
+        if any(stage for _p, stage in index.entries):
+            raise GitError("cannot move paths while the index has unresolved conflicts")
+        norm = lambda p: os.path.normpath(os.path.join(prefix, p)).replace(os.sep, "/")  # noqa: E731
+        dest_rel = norm(dest)
+        dest_is_dir = os.path.isdir(self._full(dest_rel)) and not os.path.islink(self._full(dest_rel))
+        if len(sources) > 1 and not dest_is_dir:
+            raise GitError("destination '%s' is not a directory" % dest)
+        moves = []
+        for src in sources:
+            src_rel = norm(src)
+            if src_rel in ("", ".") or src_rel.startswith(".."):
+                raise GitError("bad source '%s'" % src)
+            st = self._lstat(src_rel)
+            if st is None:
+                raise GitError("bad source, source=%s, destination=%s" % (src_rel, dest_rel))
+            target = posixpath.join(dest_rel, posixpath.basename(src_rel)) if dest_is_dir else dest_rel
+            parent = posixpath.dirname(target)
+            if parent and not os.path.isdir(self._full(parent)):
+                raise GitError("destination directory does not exist, source=%s, destination=%s" % (src_rel, target))
+            if statmod.S_ISDIR(st.st_mode):
+                under = [e.path for e in index.zero_entries() if e.path.startswith(src_rel + "/")]
+                if not under:
+                    raise GitError("source directory is empty, source=%s, destination=%s" % (src_rel, target))
+                if dest_is_dir is False and os.path.exists(self._full(target)) and not force:
+                    raise GitError("destination exists, source=%s, destination=%s" % (src_rel, target))
+                if target == src_rel or target.startswith(src_rel + "/"):
+                    raise GitError("can not move directory into itself, source=%s, destination=%s" % (src_rel, target))
+                moves += [(p, target + p[len(src_rel):]) for p in under]
+                continue
+            if index.get(src_rel) is None:
+                raise GitError("not under version control, source=%s, destination=%s" % (src_rel, target))
+            if os.path.lexists(self._full(target)) and not force:
+                raise GitError("destination exists, source=%s, destination=%s" % (src_rel, target))
+            if target == src_rel:
+                raise GitError("can not move to itself, source=%s, destination=%s" % (src_rel, target))
+            moves.append((src_rel, target))
+        for old, new in moves:
+            entry = index.get(old)
+            os.makedirs(os.path.dirname(self._full(new)) or self.worktree, exist_ok=True)
+            if os.path.lexists(self._full(new)) and not os.path.isdir(self._full(new)):
+                os.unlink(self._full(new))
+            os.rename(self._full(old), self._full(new))
+            index.remove(old)
+            index.set(ix.IndexEntry(new, entry.mode, entry.oid, **ix.stat_fields(os.lstat(self._full(new)))))
+            self._prune_empty_dirs(os.path.dirname(old))
+        self.write_index(index)
+        return moves
 
     def _prune_empty_dirs(self, rel_dir):
         while rel_dir:
@@ -987,19 +1070,19 @@ class Repo:
             return (0, None, b"")
         return (side.mode, NULL_OID, side.data)
 
-    def diff_snapshots(self, old, new, context=3, paths=None, renames=rn.DEFAULT_MINIMUM_SCORE):
+    def diff_snapshots(self, old, new, context=3, paths=None, renames=None):
         return self.render_changes(self.detect_renames(self.changes_snapshots(old, new, paths), renames), context)
 
-    def diff_worktree(self, paths=None, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
+    def diff_worktree(self, paths=None, context=3, renames=None):
         return self.render_changes(self.detect_renames(self.changes_worktree(paths), renames), context)
 
-    def diff_against_commit(self, commit, paths=None, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
+    def diff_against_commit(self, commit, paths=None, context=3, renames=None):
         return self.render_changes(self.detect_renames(self.changes_against_commit(commit, paths), renames), context)
 
-    def diff_cached(self, against=None, paths=None, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
+    def diff_cached(self, against=None, paths=None, context=3, renames=None):
         return self.render_changes(self.detect_renames(self.changes_cached(against, paths), renames), context)
 
-    def diff_commits(self, a, b, paths=None, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
+    def diff_commits(self, a, b, paths=None, context=3, renames=None):
         return self.render_changes(self.detect_renames(self.changes_commits(a, b, paths), renames), context)
 
     def combined_diff(self, oid, parents=None, dense=True, context=3, paths=None):
@@ -1024,7 +1107,7 @@ class Repo:
         mode, oid = entry
         return (mode, oid, lambda: self.odb.read(oid)[1])
 
-    def show_commit(self, oid, context=3, dense=True, renames=rn.DEFAULT_MINIMUM_SCORE):
+    def show_commit(self, oid, context=3, dense=True, renames=None):
         c = self.read_commit(oid)
         text = self.format_commit(oid).encode("utf-8", "surrogateescape")
         if len(c.parents) > 1:
@@ -1032,7 +1115,7 @@ class Repo:
         patch = self.diff_commits(c.parents[0] if c.parents else None, oid, context=context, renames=renames)
         return text + (b"\n" + patch if patch else b"")
 
-    def show_tag(self, oid, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
+    def show_tag(self, oid, context=3, renames=None):
         """``git show`` of an annotated tag: the tag's own header and message, then what it points at."""
         tag = Tag.parse(self.odb.read(oid)[1])
         lines = ["tag " + tag.name]
@@ -1041,7 +1124,7 @@ class Repo:
         text = "\n".join(lines) + "\n\n" + tag.message.rstrip("\n") + "\n\n"
         target = tag.object
         kind = self.odb.kind_of(target)
-        return text.encode("utf-8", "surrogateescape") + (self.show_commit(target, context) if kind == "commit" else self.show_tag(target, context) if kind == "tag" else b"")
+        return text.encode("utf-8", "surrogateescape") + (self.show_commit(target, context, renames=renames) if kind == "commit" else self.show_tag(target, context, renames=renames) if kind == "tag" else b"")
 
     # --- branches and tags -----------------------------------------------------------------------------------------------------------------------
     def branches(self):
@@ -1057,7 +1140,30 @@ class Repo:
         if oid is None:
             raise GitError("not a valid object name: 'HEAD' (the current branch has no commits yet)")
         self.refs.update(ref, oid, log=self.log_entry("branch: Created from %s" % (start or self.refs.current_branch() or "HEAD")))
+        if start:
+            self._auto_track(name, start)
         return oid
+
+    def _auto_track(self, branch, start):
+        """A branch started from a remote-tracking branch follows it (``branch.autoSetupMerge``)."""
+        if self.config.get("branch.autoSetupMerge", "true") in ("false", "no", "off", "0"):
+            return
+        from . import remote as rm
+        for cand in (start, "refs/remotes/" + start, "refs/" + start):
+            if not cand.startswith("refs/remotes/"):
+                continue
+            if not self.refs.exists(cand):
+                continue
+            rest = cand[len("refs/remotes/"):]
+            for remote in rm.remote_names(self):
+                if rest.startswith(remote + "/"):
+                    for spec in rm.remote_fetch_specs(self, remote):
+                        if spec.dst and "*" in spec.dst:
+                            mid = rm.match_pattern(spec.dst, cand)
+                            if mid is not None:
+                                rm.set_upstream(self, branch, remote, spec.src.replace("*", mid))
+                                self.notes.append("branch '%s' set up to track '%s'." % (branch, rest))
+                                return
 
     def delete_branch(self, name, force=False):
         ref = "refs/heads/" + name
@@ -1071,6 +1177,8 @@ class Repo:
             if head is None or oid not in set(self.walk([head])):
                 raise GitError(f"the branch '{name}' is not fully merged (use -D to delete it anyway)")
         self.refs.delete(ref)
+        if self.config.local.remove_section("branch", name):
+            self.config.local.save()
         return oid
 
     def rename_branch(self, old, new):
@@ -1088,6 +1196,8 @@ class Repo:
         if current:
             self.refs.set_symbolic("HEAD", "refs/heads/" + new)
         self.refs.delete("refs/heads/" + old)
+        if self.config.local.rename_section("branch", old, new):
+            self.config.local.save()
         entry = self.log_entry(message)
         if entry:
             self.refs.append_log("refs/heads/" + new, oid, oid, *entry)

@@ -31,6 +31,10 @@ class PktReader:
 
     def __init__(self, read):
         self._read = read
+        self._back = []
+
+    def unread(self, packet):
+        self._back.append(packet)
 
     def _exact(self, n):
         out = b""
@@ -43,6 +47,8 @@ class PktReader:
 
     def packet(self):
         """The next packet: bytes (without the length), or ``FLUSH`` / ``DELIM`` / ``END``; ``None`` at the end of the stream."""
+        if self._back:
+            return self._back.pop()
         try:
             head = self._read(4)
             if not head:
@@ -127,7 +133,7 @@ def ls_refs_request(prefixes=(), symrefs=True, peel=True, unborn=False):
         out.append(pkt_text("symrefs"))
     if unborn:
         out.append(pkt_text("unborn"))
-    for p in prefixes:
+    for p in prefixes or ():
         out.append(pkt_text("ref-prefix " + p))
     out.append(b"0000")
     return b"".join(out)
@@ -138,6 +144,9 @@ def parse_ls_refs(reader):
     refs = []
     for line in reader.until_flush():
         parts = line.decode("utf-8", "surrogateescape").split(" ")
+        if parts[0] == "unborn":                                  # HEAD of an empty repository: no id, only the branch it will become
+            refs.append((parts[1], None, next((a[len("symref-target:"):] for a in parts[2:] if a.startswith("symref-target:")), None), None))
+            continue
         oid, name, target, peeled = parts[0], parts[1], None, None
         for attr in parts[2:]:
             if attr.startswith("symref-target:"):

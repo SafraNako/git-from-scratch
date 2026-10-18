@@ -2,9 +2,7 @@
 import io
 import os
 import re
-import shutil
 import subprocess
-import threading
 
 import gitoracle as go
 from kendi_git import cli
@@ -154,9 +152,11 @@ class RTwin:
                     continue
                 assert g[key] == k[key], "%s differs %s:\n git: %r\n ours: %r" % (key, label, g[key], k[key])
             fsck = go.git(self.dir["k"], "fsck", "--strict", check=False)
-            assert fsck.returncode == 0 and not fsck.stdout.strip() and not fsck.stderr.decode().strip().replace("Checking object directories", ""), "fsck of our clone %s: %r %r" % (label, fsck.stdout, fsck.stderr)
+            problems = [l for l in fsck.stdout.decode().splitlines() if not l.startswith("dangling ")]          # a conflicted merge leaves the marker blob unreferenced
+            assert fsck.returncode == 0 and not problems and not fsck.stderr.decode().strip().replace("Checking object directories", ""), "fsck of our clone %s: %r %r" % (label, fsck.stdout, fsck.stderr)
         if upstream:
             g, k = self.snapshot("g", self.up["g"], bare=True), self.snapshot("k", self.up["k"], bare=True)
-            assert g["refs"] == k["refs"], "upstream refs differ %s:\n git: %r\n ours: %r" % (label, g["refs"], k["refs"])
+            keep = lambda refs: [r for r in refs if r.startswith(("refs/heads/", "refs/tags/"))]  # noqa: E731  (the feeder's mirror pushes also carry its remote-tracking refs)
+            assert keep(g["refs"]) == keep(k["refs"]), "upstream refs differ %s:\n git: %r\n ours: %r" % (label, g["refs"], k["refs"])
             fsck = go.git(self.up["k"], "fsck", "--strict", check=False)
             assert fsck.returncode == 0, "fsck of the upstream after our push %s: %r" % (label, fsck.stderr)

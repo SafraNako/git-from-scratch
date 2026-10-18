@@ -6,7 +6,7 @@ and finally every remaining pair is scored by how much of the new file's materia
 """
 from __future__ import annotations
 
-from .diff import RenamedSide, is_binary
+from .diff import RenamedSide, Side, is_binary
 
 MAX_SCORE = 60000
 DEFAULT_MINIMUM_SCORE = 30000
@@ -108,8 +108,8 @@ def detect_renames(changes, minimum_score=DEFAULT_MINIMUM_SCORE, rename_limit=DE
     typechanged = {p for p, v in both.items() if len(v) > 1}                      # a file turning into a link and back is no rename candidate
     srcs, dsts = [], []
     for path, old, new in changes:
-        if path in typechanged:
-            continue
+        if path in typechanged or not (old is None or isinstance(old, Side)) or not (new is None or isinstance(new, Side)):
+            continue                                                  # (a conflicted path is neither a deletion nor an addition)
         if old is None and new is not None:
             if rename_empty or new.oid != EMPTY_BLOB:
                 dsts.append({"path": path, "file": _File(path, new), "pair": None})
@@ -270,3 +270,34 @@ def parse_score(text):
         else:
             break
     return MAX_SCORE if num >= scale else MAX_SCORE * num // scale
+
+
+def find_follow_source(parent_files, current_files, path, new_side, odb_side, minimum_score=DEFAULT_MINIMUM_SCORE):
+    """For ``log --follow``: the file of the parent commit that the new file at ``path`` came from, as a rename or as a copy. Identical content is looked for in every
+    file of the parent; otherwise files the commit deleted or changed are compared first and only if none of them is similar enough the untouched ones (git's
+    ``--find-copies-harder`` does it in this order). Returns ``(source path, score)`` or ``None``. ``odb_side(mode, oid)`` makes a ``Side`` that can read the content."""
+    dst = _File(path, new_side)
+    candidates = sorted(parent_files.items(), key=lambda kv: kv[0].encode("utf-8", "surrogateescape"))
+    best, best_score = None, -1
+    for p, (mode, oid) in candidates:                                   # identical content first, preferring the same base name
+        if oid != new_side.oid or ((mode not in (0o100644, 0o100755) or not dst.regular) and mode != new_side.mode):
+            continue
+        score = 1 + (1 if basename_same(p, path) else 0)
+        if score > best_score:
+            best, best_score = p, score
+            if score == 2:
+                break
+    if best is not None:
+        return best, MAX_SCORE
+    for untouched in (False, True):
+        best, best_key = None, None
+        for p, (mode, oid) in candidates:
+            if mode not in (0o100644, 0o100755) or (current_files.get(p) == (mode, oid)) != untouched:
+                continue
+            score = estimate_similarity(_File(p, odb_side(mode, oid)), dst, minimum_score)
+            key = (score, 1 if basename_same(p, path) else 0)
+            if best_key is None or key > best_key:
+                best, best_key = p, key
+        if best is not None and best_key[0] >= minimum_score:
+            return best, best_key[0]
+    return None

@@ -19,6 +19,7 @@ from . import diff as df
 from . import fsck as fsck_mod
 from . import index as ix
 from . import merge as mg
+from . import remote as rm
 from .config import ConfigFile
 from .errors import GitError
 from .objects import Commit, Ident, Tag, TreeEntry, hash_object, serialize_tree
@@ -390,7 +391,7 @@ def check_merges(tmp, rng, scale):
             git(repo, "commit", "-qm", "side", "--allow-empty", extra=dated(10 * n + 1 + side))
             commits.append(gits(repo, "rev-parse", "HEAD").strip())
         mine = ours(repo)
-        proc = git(repo, "-c", "merge.renames=false", "merge-tree", "--write-tree", "--no-messages", *commits, check=False)
+        proc = git(repo, "merge-tree", "--write-tree", "--no-messages", *commits, check=False)
         files = lambda c: mine.tree_files(mine.read_commit(c).tree)  # noqa: E731
         merged, conflicts = mg.merge_trees(mine, files(base), files(commits[0]), files(commits[1]))
         if proc.returncode == 0:
@@ -400,6 +401,94 @@ def check_merges(tmp, rng, scale):
             assert conflicts
             conflicted += 1
     return "%d clean merges identical, %d conflicts agreed" % (clean, conflicted)
+
+
+def check_renames(tmp, rng, scale):
+    repo = new_repo(tmp, "renames")
+    names = ["a.txt", "dir/b.txt", "dir/sub/c.txt", "d.py", "e/f.md", "g.cfg"]
+    for name in names:
+        write(repo, name, unique_text(rng, b"", 30))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "base", extra=dated(1))
+    for name in names[:4]:
+        data = open(os.path.join(repo, name), "rb").read()
+        for _ in range(rng.randint(0, 3)):
+            data = unique_text(rng, data)
+        os.unlink(os.path.join(repo, name))
+        write(repo, "moved/" + os.path.basename(name) + ("x" if rng.random() < 0.3 else ""), data)
+    git(repo, "add", "-A")
+    mine = ours(repo)
+    staged = [l for l in gits(repo, "status", "--porcelain").splitlines() if l.startswith("R")]
+    assert ["%s%s %s -> %s" % (x, y, mine.status().renames[p], p) for x, y, p in mine.status().entries if x == "R"] == staged and staged
+    git(repo, "commit", "-qm", "moved", extra=dated(2))
+    mine = ours(repo)
+    base, head = gits(repo, "rev-parse", "HEAD~1").strip(), gits(repo, "rev-parse", "HEAD").strip()
+    theirs = git(repo, "diff", "--no-color", "-M", base, head)
+    assert mine.diff_commits(base, head, renames=30000) == theirs
+    return "%d renames found, %d bytes of patch identical" % (len(staged), len(theirs))
+
+
+def check_combined_diffs(tmp, rng, scale):
+    repo = new_repo(tmp, "combined")
+    shown = 0
+    for n in range(1, 4 * scale + 1):
+        git(repo, "checkout", "-q", "-B", "main")
+        write(repo, "f.txt", unique_text(rng, b"", 12))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "base %d" % n, extra=dated(10 * n))
+        base = gits(repo, "rev-parse", "HEAD").strip()
+        sides = []
+        for side in range(2):
+            git(repo, "checkout", "-q", "--detach", base)
+            data = open(os.path.join(repo, "f.txt"), "rb").read()
+            for _ in range(rng.randint(1, 3)):
+                data = unique_text(rng, data)
+            write(repo, "f.txt", data)
+            git(repo, "commit", "-qam", "side %d" % side, extra=dated(10 * n + 1 + side))
+            sides.append(gits(repo, "rev-parse", "HEAD").strip())
+        git(repo, "checkout", "-q", "-B", "main", sides[0])
+        git(repo, "merge", "-q", "--no-commit", "--no-ff", sides[1], check=False)
+        mixed = open(os.path.join(repo, "f.txt"), "rb").read().replace(b"<<<<<<< HEAD\n", b"").replace(b"=======\n", b"").replace(b">>>>>>> " + sides[1].encode() + b"\n", b"")
+        write(repo, "f.txt", re.sub(rb">>>>>>> [^\n]*\n", b"", mixed))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-qm", "merge %d" % n, extra=dated(10 * n + 5))
+        head = gits(repo, "rev-parse", "HEAD").strip()
+        mine = ours(repo)
+        assert mine.show_commit(head) == git(repo, "show", "--no-color", "--no-decorate", head)
+        assert mine.show_commit(head, dense=False) == git(repo, "show", "--no-color", "--no-decorate", "-c", head)
+        shown += 1
+    return "%d merge commits: --cc and -c output identical" % shown
+
+
+def check_remote_roundtrip(tmp, rng, scale):
+    upstream = os.path.join(tmp, "up.git")
+    git(tmp, "init", "-q", "--bare", "-b", "main", upstream)
+    feeder = new_repo(tmp, "feeder")
+    write(feeder, "a.txt", unique_text(rng, b"", 20))
+    git(feeder, "add", "-A")
+    git(feeder, "commit", "-qm", "first", extra=dated(1))
+    git(feeder, "tag", "-a", "v1", "-m", "one", extra=dated(2))
+    git(feeder, "push", "-q", upstream, "main", "v1")
+    clone, _notes = rm.clone(upstream, os.path.join(tmp, "clone"), env=_env(dated(3)), now=lambda: 1700000300, cwd=tmp)
+    assert gits(clone.worktree, "fsck", "--strict") == ""
+    tip = lambda path, ref: gits(path, "rev-parse", ref).strip()  # noqa: E731
+    commits = 0
+    for n in range(2, 2 + 3 * scale):
+        write(feeder, "a.txt", unique_text(rng, open(os.path.join(feeder, "a.txt"), "rb").read()))
+        git(feeder, "commit", "-qam", "up %d" % n, extra=dated(10 * n))
+        git(feeder, "push", "-q", upstream, "main")
+        clone = Repo(clone.gitdir, clone.worktree, env=_env(dated(10 * n + 1)), now=lambda n=n: 1700000000 + 100 * (10 * n + 1))
+        rm.fetch(clone, "origin")
+        assert tip(clone.worktree, "refs/remotes/origin/main") == tip(upstream, "refs/heads/main")
+        commits += 1
+    mg.merge(clone, "refs/remotes/origin/main")                      # catch up with what was fetched, then add a commit of our own
+    write(clone.worktree, "local.txt", unique_text(rng, b"", 5))
+    clone.add(["local.txt"])
+    clone.commit("local")
+    result = rm.push(clone, "origin", ["main"])
+    assert result.ok and tip(upstream, "refs/heads/main") == tip(clone.worktree, "refs/heads/main")
+    assert gits(upstream, "fsck", "--strict") == ""
+    return "clone, %d fetches and a push agree with git (fsck clean)" % commits
 
 
 def check_corruption_detection(tmp, rng, scale):
@@ -451,7 +540,8 @@ DIFFERENTIAL = [("gevşek nesneler: iki yönlü", check_loose_objects), ("paket 
                 ("indeks ve ağaç nesneleri", check_index_and_trees), ("rastgele oturumlar (add/commit/branch/checkout)", check_sessions),
                 ("commit kimliği (aynı ortam, aynı nesne)", check_commit_identity), ("geçmiş sırası ve birleştirme tabanı", check_history_order),
                 ("yama (diff) çıktısı", check_patches), ("gitignore kararları", check_ignore), ("ağaç birleştirme (merge-tree)", check_merges),
-                ("bozulma tespiti (fsck)", check_corruption_detection), ("referanslar ve yapılandırma", check_refs_and_config)]
+                ("yeniden adlandırma tespiti", check_renames), ("birleşik diff (merge commit)", check_combined_diffs),
+                ("klonla / getir / gönder (yerel depo)", check_remote_roundtrip), ("bozulma tespiti (fsck)", check_corruption_detection), ("referanslar ve yapılandırma", check_refs_and_config)]
 
 
 def run(out, quick=False, seed=1):

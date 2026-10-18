@@ -200,6 +200,63 @@ class Pack:
         self._cache[offset] = result
         return result
 
+    def raw_delta(self, oid):
+        """If ``oid`` is stored here as a delta: ``(base object id, delta size, compressed delta bytes)`` exactly as they sit in the pack, otherwise ``None``."""
+        off = self.offset_of(oid)
+        if off is None:
+            return None
+        buf = self.pack
+        pos = off
+        c = buf[pos]
+        pos += 1
+        kind, size, shift = (c >> 4) & 7, c & 15, 4
+        while c & 0x80:
+            c = buf[pos]
+            pos += 1
+            size |= (c & 0x7F) << shift
+            shift += 7
+        if kind == OFS_DELTA:
+            c = buf[pos]
+            pos += 1
+            back = c & 0x7F
+            while c & 0x80:
+                c = buf[pos]
+                pos += 1
+                back = ((back + 1) << 7) | (c & 0x7F)
+            base_oid = self._oid_at_offset(off - back)
+        elif kind == REF_DELTA:
+            base_oid = buf[pos:pos + 20].hex()
+            pos += 20
+        else:
+            return None
+        return base_oid, size, bytes(buf[pos:self._end_of(off)])
+
+    def _offsets(self):
+        if getattr(self, "_off_index", None) is None:
+            pairs = []
+            for i in range(self.count):
+                o = struct.unpack(">I", self.idx[self._off_at + 4 * i:self._off_at + 4 * i + 4])[0]
+                if o & 0x80000000:
+                    j = o & 0x7FFFFFFF
+                    o = struct.unpack(">Q", self.idx[self._big_at + 8 * j:self._big_at + 8 * j + 8])[0]
+                pairs.append((o, i))
+            pairs.sort()
+            self._off_index = ([p[0] for p in pairs], [p[1] for p in pairs])
+        return self._off_index
+
+    def _oid_at_offset(self, offset):
+        offsets, indexes = self._offsets()
+        k = bisect.bisect_left(offsets, offset)
+        if k == len(offsets) or offsets[k] != offset:
+            raise GitError("pack delta base offset does not point at an object")
+        return self.oid_at(indexes[k])
+
+    def _end_of(self, offset):
+        """Where the object starting at ``offset`` ends: the start of the next one (or the trailer)."""
+        offsets, _ = self._offsets()
+        k = bisect.bisect_right(offsets, offset)
+        return offsets[k] if k < len(offsets) else len(self.pack) - 20
+
     def verify_checksums(self):
         """Whether the trailing SHA-1 of the pack and of the index match their content (``(pack_ok, idx_ok)``)."""
         import hashlib

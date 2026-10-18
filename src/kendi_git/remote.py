@@ -136,9 +136,20 @@ def resolve_url(repo, url):
     return os.path.normpath(os.path.join(base, url))
 
 
+def anonymize(url):
+    """A URL without the user name and password that may be in front of the host."""
+    if "://" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    host, slash, path = rest.partition("/")
+    if "@" in host:
+        host = host.rsplit("@", 1)[1]
+    return scheme + "://" + host + slash + path
+
+
 def tidy_url(url):
-    """How git writes a URL in ``From ...`` lines and in FETCH_HEAD: no trailing slashes and no ``.git`` suffix."""
-    url = url.rstrip("/")
+    """How git writes a URL in ``From ...`` lines and in FETCH_HEAD: no credentials, no trailing slashes and no ``.git`` suffix."""
+    url = anonymize(url).rstrip("/")
     return url[:-4] if url.endswith(".git") and len(url) > 4 else url
 
 
@@ -433,6 +444,9 @@ class PushResult:
     lines: list = field(default_factory=list)
     ok: bool = True
     up_to_date: bool = False
+    url: str = ""
+    hints: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
 
 
 def _expand_push_spec(repo, spec, current):
@@ -498,7 +512,7 @@ def push(repo, remote=None, refspecs=(), force=False, delete=False, set_upstream
         if cur is None:
             raise GitError("You are not currently on a branch.")
         up = upstream_of(repo, cur)
-        if up and up[0] == remote and explicit_remote is False or (up and up[0] == remote):
+        if up and up[0] == remote:
             if up[1] != "refs/heads/" + cur and repo.config.get("push.default", "simple") == "simple":
                 raise GitError("The upstream branch of your current branch does not match the name of your current branch.")
             specs = ["refs/heads/%s:%s" % (cur, up[1])]
@@ -523,11 +537,11 @@ def push(repo, remote=None, refspecs=(), force=False, delete=False, set_upstream
             short_dst = _short(dst)
             if src is None:
                 if old is None:
-                    rows.append(("!", "[remote rejected]", short_src, short_dst, "(remote ref does not exist)"))
+                    result.errors.append("unable to delete '%s': remote ref does not exist" % short_dst)
                     result.ok = False
                     continue
                 commands.append((old, ZERO, dst))
-                rows.append((" -", "[deleted]", short_src, short_dst, ""))
+                rows.append(("-", "[deleted]", None, short_dst, ""))
                 continue
             new = repo.refs.read(src) if src.startswith("refs/") else repo.rev_parse(src)
             if new is None:
@@ -566,8 +580,9 @@ def push(repo, remote=None, refspecs=(), force=False, delete=False, set_upstream
         if commands and not dry_run:
             have = [o for o in remote_refs.values() if repo.odb.exists(o)]
             to_send = [c for c in commands if c[1] != ZERO]
-            objects = collect_objects(repo, [c[1] for c in to_send], have) if to_send else []
-            unpack, results = t.push(commands, objects)
+            # an update (not just deletions) always comes with a pack, even an empty one
+            pack = packio.iter_pack(collect_objects(repo, [c[1] for c in to_send], have), repo.odb.read, repo.odb.raw_delta) if to_send else None
+            unpack, results = t.push(commands, pack)
             if unpack not in (None, "ok"):
                 raise GitError("remote unpack failed: %s" % unpack)
             for old, new, ref in commands:
@@ -584,10 +599,24 @@ def push(repo, remote=None, refspecs=(), force=False, delete=False, set_upstream
         shown = [r for r in rows if r[0] != "="]                           # up-to-date refs are only listed in verbose mode
         if shown:
             width = 2 * len(repo.odb.abbrev("0" * 40)) + 3
-            result.lines.append("To " + url)
+            result.lines.append("To " + anonymize(url))
             for flag, summary, src, dst, note in shown:
-                result.lines.append(" %s %s %s -> %s%s" % (flag, summary.ljust(width), src, dst, " " + note if note else ""))
+                if src is None:                                               # a deletion names only the ref
+                    result.lines.append(" %s %s %s" % (flag, summary.ljust(width), dst))
+                else:
+                    result.lines.append(" %s %s %s -> %s%s" % (flag, summary.ljust(width), src, dst, " " + note if note else ""))
         result.up_to_date = not shown and result.ok
+        result.url = anonymize(url)
+        notes = {r[4] for r in shown if r[0] == "!"}
+        if "(fetch first)" in notes:
+            result.hints = ["Updates were rejected because the remote contains work that you do", "not have locally. This is usually caused by another repository pushing",
+                            "to the same ref. You may want to first integrate the remote changes", "(e.g., 'kgit pull ...') before pushing again.",
+                            "See the 'Note about fast-forwards' in 'git push --help' for details."]
+        elif "(non-fast-forward)" in notes:
+            result.hints = ["Updates were rejected because the tip of your current branch is behind", "its remote counterpart. Integrate the remote changes (e.g.",
+                            "'kgit pull ...') before pushing again.", "See the 'Note about fast-forwards' in 'git push --help' for details."]
+        elif "(already exists)" in notes:
+            result.hints = ["Updates were rejected because the tag already exists in the remote."]
         if named and not dry_run:
             _update_tracking_after_push(repo, remote, commands, local_updates)
     finally:
@@ -650,11 +679,12 @@ def clone(url, directory=None, bare=False, branch=None, origin="origin", checkou
         os.makedirs(target, exist_ok=True)
         probe = open_transport(url, None, env or {}, cwd=cwd)
         try:
-            listing = probe.ls_refs(["HEAD", "refs/heads/", "refs/tags/"])
+            listing = probe.ls_refs(["HEAD", "refs/heads/", "refs/tags/"], unborn=True)
         finally:
             probe.close()
-        remote_refs = {name: oid for name, oid, _t, _p in listing}
+        remote_refs = {name: oid for name, oid, _t, _p in listing if oid}
         head_target = next((tg for name, _o, tg, _p in listing if name == "HEAD"), None)
+        unborn_target = head_target if not remote_refs.get("HEAD") else None
         if head_target is None and remote_refs.get("HEAD"):
             head_target = next((n for n, o in remote_refs.items() if n.startswith("refs/heads/") and o == remote_refs["HEAD"]), None)
         remote_head = head_target                     # origin/HEAD follows the server's HEAD even when another branch is asked for
@@ -675,6 +705,8 @@ def clone(url, directory=None, bare=False, branch=None, origin="origin", checkou
         fetch(repo, origin, tags=True, cloning=True, specs=specs, url=url)
         if not remote_refs:
             notes.append("warning: You appear to have cloned an empty repository.")
+            if unborn_target and unborn_target.startswith("refs/heads/"):
+                repo.refs.set_symbolic("HEAD", unborn_target)             # the branch the other side's HEAD is waiting to become
             return repo, notes
         entry = repo.log_entry("clone: from " + url)
         if head_target and head_target.startswith("refs/heads/"):
@@ -690,6 +722,13 @@ def clone(url, directory=None, bare=False, branch=None, origin="origin", checkou
             if bare:
                 pass
             elif entry:
+                repo.refs.append_log("HEAD", ZERO, tip, *entry)
+            if not bare and checkout:
+                co.apply_switch(repo, {}, co.snapshot_of_commit(repo, tip))
+        elif remote_refs.get("HEAD") and not branch:                    # the other side's HEAD is detached: so is ours
+            tip = remote_refs["HEAD"]
+            repo.refs._write_locked("HEAD", tip)
+            if entry:
                 repo.refs.append_log("HEAD", ZERO, tip, *entry)
             if not bare and checkout:
                 co.apply_switch(repo, {}, co.snapshot_of_commit(repo, tip))

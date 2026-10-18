@@ -560,6 +560,7 @@ class RenamedSide(Side):
     """The old side of a rename: where the file was (``path``) and how similar the two contents are (``score``, out of 60000)."""
     path: str = ""
     score: int = 0
+    copy: bool = False          # the old file is still there: a copy, not a rename
 
     @property
     def similarity(self):
@@ -654,7 +655,8 @@ def render_change(path, old, new, abbrev, context=3, a_prefix="a/", b_prefix="b/
     elif old.mode != new.mode:
         head.append(b"old mode %06o\nnew mode %06o\n" % (old.mode, new.mode))
     if renamed:
-        head.append(b"similarity index %d%%\nrename from %s\nrename to %s\n" % (old.similarity, quote_path(old.path).encode(), quote_path(path).encode()))
+        word = b"copy" if old.copy else b"rename"
+        head.append(b"similarity index %d%%\n%s from %s\n%s to %s\n" % (old.similarity, word, quote_path(old.path).encode(), word, quote_path(path).encode()))
     old_oid = old.oid if old else NULL_OID
     new_oid = new.oid if new else NULL_OID
     if old_oid != new_oid:
@@ -828,7 +830,7 @@ def format_summary(changes):
         elif new is None:
             out.append(" delete mode %06o %s\n" % (old.mode, q))
         elif isinstance(old, RenamedSide):
-            out.append(" rename %s (%d%%)\n" % (rename_label(old.path, path), old.similarity))
+            out.append(" %s %s (%d%%)\n" % ("copy" if old.copy else "rename", rename_label(old.path, path), old.similarity))
             if old.mode != new.mode:
                 out.append(" mode change %06o => %06o\n" % (old.mode, new.mode))             # no name: the rename line already gave it
         elif old.mode != new.mode:

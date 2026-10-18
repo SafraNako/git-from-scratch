@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "git-from-scratch"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Git client written from scratch in pure Python: blob/tree/commit/tag objects, loose and packed object stores, the index, refs and init/add/commit/log/diff/branch/checkout/merge, validated byte for byte against real git"
 readme = "README.md"
 requires-python = ">=3.9"

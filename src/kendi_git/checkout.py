@@ -204,6 +204,10 @@ def checkout(repo, target, create=None, detach=False):
     head_oid = repo.refs.head_oid()
     old = snapshot_of_commit(repo, head_oid)
     branch_ref = None
+    if not create and target is not None and not detach and not repo.refs.exists("refs/heads/" + target):
+        guess = _remote_branch_for(repo, target)
+        if guess:                                           # "checkout dev" with only origin/dev around: create dev following it
+            create, target = target, guess
     if create:
         from .refs import check_branch_name
         if not check_branch_name(create):
@@ -231,6 +235,8 @@ def checkout(repo, target, create=None, detach=False):
     came_from = value[len("refs/heads/"):] if kind == "ref" and value.startswith("refs/heads/") else (value if kind == "detached" else repo.refs.current_branch() or "HEAD")
     if create:
         repo.refs.update(branch_ref, new_oid, log=repo.log_entry("branch: Created from %s" % (target or "HEAD")))
+        if target:
+            repo._auto_track(create, target)
     if branch_ref:
         repo.refs.set_symbolic("HEAD", branch_ref)
         result = Switched("new-branch" if create else "branch", branch_ref[len("refs/heads/"):], new_oid, repo.read_commit(new_oid).subject)
@@ -241,6 +247,18 @@ def checkout(repo, target, create=None, detach=False):
     if entry:
         repo.refs.append_log("HEAD", head_oid, new_oid, *entry)
     return result
+
+
+def _remote_branch_for(repo, name):
+    """The remote-tracking branch ``name`` would be created from when there is no such local branch: the only ``refs/remotes/<remote>/<name>``."""
+    try:
+        repo.rev_parse(name)
+        return None                                          # it names something already (a tag, a commit, ...)
+    except GitError:
+        pass
+    from . import remote as rm
+    found = [ref for ref in ("refs/remotes/%s/%s" % (r, name) for r in rm.remote_names(repo)) if repo.refs.exists(ref)]
+    return found[0] if len(found) == 1 else None
 
 
 def reset(repo, target="HEAD", mode="mixed"):

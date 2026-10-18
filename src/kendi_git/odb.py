@@ -79,6 +79,16 @@ class ObjectDB:
                 return found
         return ("tree", b"") if oid == EMPTY_TREE else None            # git knows the empty tree without it being stored
 
+    def raw_delta(self, oid):
+        """``(base id, delta size, compressed delta)`` if one of our packs stores ``oid`` as a delta (so a pack for someone else can copy it), else ``None``."""
+        if os.path.exists(self._loose_path(oid)):
+            return None
+        for pack in self.packs():
+            found = pack.raw_delta(oid)
+            if found is not None:
+                return found
+        return None
+
     def _read_external(self, oid):
         return self._read(oid)
 

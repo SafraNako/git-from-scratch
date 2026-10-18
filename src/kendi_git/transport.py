@@ -15,12 +15,12 @@ import urllib.request
 from . import packio
 from . import protocol as pr
 from .errors import GitError
-from .objects import Commit, Tag, is_oid
+from .objects import Tag, is_oid
 
 
 # --- which objects go into a pack -------------------------------------------------------------------------------------------------------------------
 def collect_objects(repo, wants, haves):
-    """The ``(kind, data)`` of every object needed to complete the history of ``wants`` for a receiver that has ``haves``. Tags are followed to what they point at."""
+    """``[(kind, oid)]`` of every object needed to complete the history of ``wants`` for a receiver that has ``haves``. Tags are followed to what they point at."""
     odb = repo.odb
     have_commits = set()
     for h in haves:
@@ -30,12 +30,9 @@ def collect_objects(repo, wants, haves):
         except GitError:
             continue
     boring = repo.reachable(have_commits) if have_commits else set()
-    out, seen_commits, seen = [], set(), set()
-    known = set()                                       # trees and blobs the receiver surely has: those of the boundary commits
-    stack = []
-    for w in wants:
-        stack.append(w)
-    commits = []
+    out, seen, commits = [], set(), []
+    stack = list(wants)
+    loose = []                                          # refs that point straight at a tree or blob
     while stack:
         oid = stack.pop()
         if oid in seen:
@@ -43,34 +40,26 @@ def collect_objects(repo, wants, haves):
         kind, data = odb.read(oid)
         if kind == "tag":
             seen.add(oid)
-            out.append((kind, data))
+            out.append(("tag", oid))
             stack.append(Tag.parse(data).object)
         elif kind == "commit":
             if oid in boring:
                 continue
             seen.add(oid)
-            seen_commits.add(oid)
             commits.append(oid)
-            out.append((kind, data))
-            stack.extend(Commit.parse(data).parents)
-        elif kind in ("tree", "blob"):
-            commits.append(oid)                           # a ref pointing straight at a tree or blob
-    boundary = set()
-    for c in commits:
-        if c in seen_commits:
-            for p in repo.read_commit(c).parents:
-                if p in boring:
-                    boundary.add(p)
+            out.append(("commit", oid))
+            stack.extend(repo.read_commit(oid).parents)                 # (a shallow repository's boundary commits have no parents)
+        else:
+            seen.add(oid)
+            loose.append((kind, oid))
+    known = set()                                       # trees and blobs the receiver surely has: those of the boundary commits
+    boundary = {p for c in commits for p in repo.read_commit(c).parents if p in boring}
     for b in boundary:
         _walk_tree(repo, repo.read_commit(b).tree, known, None)
     emitted = set()
     for c in commits:
-        if c in seen_commits:
-            _walk_tree(repo, repo.read_commit(c).tree, known, (emitted, out))
-        elif c not in seen:
-            kind, data = odb.read(c)
-            out.append((kind, data))
-    return out
+        _walk_tree(repo, repo.read_commit(c).tree, known, (emitted, out))
+    return out + loose
 
 
 def _walk_tree(repo, tree, known, sink):
@@ -82,21 +71,34 @@ def _walk_tree(repo, tree, known, sink):
             continue
         if sink:
             sink[0].add(oid)
-            kind, data = repo.odb.read(oid)
-            sink[1].append((kind, data))
+            sink[1].append(("tree", oid))
         else:
             known.add(oid)
-        for e in repo.read_tree_entries(oid):
-            if e.mode == 0o160000:
-                continue
-            if e.mode == 0o040000:
-                stack.append(e.oid)
-            elif e.oid not in known and not (sink and e.oid in sink[0]):
+        for is_tree, child in _tree_children(repo.odb.read(oid)[1]):
+            if is_tree:
+                stack.append(child)
+            elif child not in known and not (sink and child in sink[0]):
                 if sink:
-                    sink[0].add(e.oid)
-                    sink[1].append(repo.odb.read(e.oid))
+                    sink[0].add(child)
+                    sink[1].append(("blob", child))
                 else:
-                    known.add(e.oid)
+                    known.add(child)
+
+
+def _tree_children(data):
+    """``[(is_tree, id)]`` of the entries of a tree object (submodule entries left out): a lean parser, since the walk reads every tree of a history."""
+    out = []
+    i, n = 0, len(data)
+    while i < n:
+        sp = data.index(b" ", i)
+        nul = data.index(b"\x00", sp)
+        mode = data[i:sp]
+        i = nul + 21
+        if mode == b"40000":
+            out.append((True, data[nul + 1:i].hex()))
+        elif mode != b"160000":
+            out.append((False, data[nul + 1:i].hex()))
+    return out
 
 
 # --- URLs ----------------------------------------------------------------------------------------------------------------------------------------------
@@ -118,7 +120,7 @@ def open_transport(url, repo=None, env=None, cwd=None):
 class Transport:
     url = ""
 
-    def ls_refs(self, prefixes=()):
+    def ls_refs(self, prefixes=(), unborn=False):
         raise NotImplementedError
 
     def fetch(self, wants, haves, depth=None):
@@ -146,14 +148,16 @@ class LocalTransport(Transport):
         if self.repo.worktree is not None and os.path.realpath(self.repo.worktree) != os.path.realpath(path):
             raise GitError("'%s' does not appear to be a git repository" % path)
 
-    def _all_refs(self):
+    def _all_refs(self, unborn=False):
         repo = self.repo
         out = []
         head = repo.refs.head_oid()
+        raw = repo.refs.read_raw("HEAD")
+        target = raw[1] if raw and raw[0] == "sym" else None
         if head:
-            raw = repo.refs.read_raw("HEAD")
-            target = raw[1] if raw and raw[0] == "sym" else None
             out.append(("HEAD", head, target, None))
+        elif unborn and target:
+            out.append(("HEAD", None, target, None))
         for name, oid in repo.refs.list("refs/"):
             peeled = None
             try:
@@ -164,23 +168,22 @@ class LocalTransport(Transport):
             out.append((name, oid, None, peeled))
         return out
 
-    def ls_refs(self, prefixes=()):
-        refs = self._all_refs()
+    def ls_refs(self, prefixes=(), unborn=False):
+        refs = self._all_refs(unborn)
         if prefixes:
             refs = [r for r in refs if any(r[0].startswith(p) or r[0] == p.rstrip("/") for p in prefixes) or r[0] == "HEAD"]
         return refs
 
     def fetch(self, wants, haves, depth=None):
-        objects = collect_objects(self.repo, wants, haves)
-        return [packio.write_pack(objects)]
+        return packio.iter_pack(collect_objects(self.repo, wants, haves), self.repo.odb.read, self.repo.odb.raw_delta)
 
     def advertise_push(self):
         return {name: oid for name, oid, _t, _p in self._all_refs() if name != "HEAD"}, {"report-status", "delete-refs"}
 
-    def push(self, commands, objects):
+    def push(self, commands, pack):
         repo = self.repo
-        if objects:
-            packio.receive_pack([packio.write_pack(objects)], repo.odb, os.path.join(repo.gitdir, "objects"))
+        if pack is not None:
+            packio.receive_pack(pack, repo.odb, os.path.join(repo.gitdir, "objects"))
         results = {}
         current = repo.refs.current_branch() if not repo.bare else None
         deny = repo.config.get("receive.denyCurrentBranch", "refuse")
@@ -237,7 +240,7 @@ class GitTransport(Transport):
 
     def _connect(self, service, v2):
         try:
-            sock = socket.create_connection((self.host, self.port), timeout=60)
+            sock = socket.create_connection((self.host, self.port), timeout=300)
         except OSError as exc:
             raise GitError("unable to connect to %s:%d: %s" % (self.host, self.port, exc))
         request = "%s %s\0host=%s\0" % (service, self.path, self.host)
@@ -250,13 +253,17 @@ class GitTransport(Transport):
     def _v2_conn(self):
         if self._v2 is None:
             conn = self._connect("git-upload-pack", True)
-            pr.parse_v2_capabilities(conn.reader)
+            conn.caps = pr.parse_v2_capabilities(conn.reader)
             self._v2 = conn
         return self._v2
 
-    def ls_refs(self, prefixes=()):
+    @staticmethod
+    def _caps_of(conn):
+        return conn.caps.get("ls-refs") or ""
+
+    def ls_refs(self, prefixes=(), unborn=False):
         conn = self._v2_conn()
-        conn.send(pr.ls_refs_request(prefixes))
+        conn.send(pr.ls_refs_request(prefixes, unborn=unborn and "unborn" in (self._caps_of(conn) or "")))
         return pr.parse_ls_refs(conn.reader)
 
     def fetch(self, wants, haves, depth=None):
@@ -269,11 +276,12 @@ class GitTransport(Transport):
         refs, caps = pr.parse_v0_advertisement(self._push_conn.reader)
         return dict(refs), caps
 
-    def push(self, commands, objects):
+    def push(self, commands, pack):
         conn = self._push_conn
         caps = ["report-status", "side-band-64k", pr.AGENT]
-        pack = packio.write_pack(objects) if objects else None
-        conn.send(pr.receive_pack_request(commands, pack, caps))
+        conn.send(pr.receive_pack_request(commands, None, caps))
+        for chunk in pack or ():
+            conn.send(chunk)
         return pr.parse_report(conn.reader, True)
 
     def close(self):
@@ -306,7 +314,7 @@ class HttpTransport(Transport):
             headers["Accept"] = "application/x-%s-result" % service
         req = urllib.request.Request(self.base + path + query, data=body, headers=headers, method="POST" if body is not None else "GET")
         try:
-            return urllib.request.urlopen(req, timeout=120)
+            return urllib.request.urlopen(req, timeout=300)
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise GitError("authentication failed for '%s' (HTTP %d); put the credentials in the URL (https://user:token@host/path)" % (self.base, exc.code))
@@ -324,9 +332,12 @@ class HttpTransport(Transport):
         reader = pr.PktReader(resp.read)
         first = reader.packet()
         if isinstance(first, bytes) and first.startswith(b"# service="):
-            reader.until_flush()
-            return reader
-        raise GitError("unexpected answer from the server")
+            reader.until_flush()                       # protocol 0/1 announces the service first; version 2 starts with its greeting
+        elif first is None:
+            raise GitError("the server sent an empty answer")
+        else:
+            reader.unread(first)
+        return reader
 
     def _v2_caps(self):
         if self._caps is None:
@@ -334,9 +345,9 @@ class HttpTransport(Transport):
             self._caps = pr.parse_v2_capabilities(reader)
         return self._caps
 
-    def ls_refs(self, prefixes=()):
-        self._v2_caps()
-        resp = self._request("/git-upload-pack", pr.ls_refs_request(prefixes), "git-upload-pack", v2=True)
+    def ls_refs(self, prefixes=(), unborn=False):
+        caps = self._v2_caps()
+        resp = self._request("/git-upload-pack", pr.ls_refs_request(prefixes, unborn=unborn and "unborn" in (caps.get("ls-refs") or "")), "git-upload-pack", v2=True)
         return pr.parse_ls_refs(pr.PktReader(resp.read))
 
     def fetch(self, wants, haves, depth=None):
@@ -349,10 +360,9 @@ class HttpTransport(Transport):
         refs, caps = pr.parse_v0_advertisement(reader)
         return dict(refs), caps
 
-    def push(self, commands, objects):
+    def push(self, commands, pack):
         caps = ["report-status", "side-band-64k", pr.AGENT]
-        pack = packio.write_pack(objects) if objects else None
-        resp = self._request("/git-receive-pack", pr.receive_pack_request(commands, pack, caps), "git-receive-pack")
+        resp = self._request("/git-receive-pack", pr.receive_pack_request(commands, b"".join(pack) if pack is not None else None, caps), "git-receive-pack")
         return pr.parse_report(pr.PktReader(resp.read), True)
 
 

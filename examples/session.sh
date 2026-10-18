@@ -25,5 +25,23 @@ kgit merge topic
 kgit log --oneline
 kgit fsck
 
+# a second copy of the repository, over the "network" (a plain path here; git:// and https:// work the same way)
+cd ..
+kgit init --bare shared.git
+cd demo
+kgit remote add origin ../shared.git
+kgit push -u origin main
+cd ..
+kgit clone shared.git copy
+cd copy
+kgit config user.name "Ada Lovelace"
+kgit config user.email ada@example.org
+printf 'one more line\n' >> greeting.txt
+kgit commit -a -m "Work in the copy"
+kgit push
+cd ../demo
+kgit pull
+kgit log --oneline
+
 # the repository is plain git: any git can read it
 if command -v git >/dev/null 2>&1; then git log --oneline --graph; fi

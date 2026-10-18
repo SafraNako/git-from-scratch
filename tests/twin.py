@@ -96,6 +96,10 @@ class Twin:
         args = ["rm", "-q"] + (["--cached"] if cached else []) + (["-f"] if force else []) + (["-r"] if recursive else []) + ["--"] + list(specs)
         return self.both(lambda: self.ours.rm(list(specs), cached=cached, force=force, recursive=recursive), *args)
 
+    def mv(self, sources, dest, force=False):
+        args = ["mv"] + (["-f"] if force else []) + list(sources) + [dest]
+        return self.both(lambda: self.ours.mv(list(sources), dest, force=force), *args)
+
     def commit(self, message, allow_empty=False, amend=False, no_edit=False):
         args = ["commit", "-q"] + (["--no-edit"] if no_edit else ["-m", message]) + (["--allow-empty"] if allow_empty else []) + (["--amend"] if amend else [])
         return self.both(lambda: self.ours.commit(None if no_edit else message, amend=amend, allow_empty=allow_empty), *args)
@@ -124,7 +128,7 @@ class Twin:
             if mg.merge(self.ours, spec, ff=ff).kind == "conflict":
                 raise GitError("conflict")                       # the repository now holds the conflicted merge, exactly as after git's failed merge
 
-        return self.both(ours_merge, "-c", "merge.renames=false", "-c", "diff.renames=false", "merge", "-q", "--no-edit", *flags, spec)
+        return self.both(ours_merge, "merge", "-q", "--no-edit", *flags, spec)
 
     def merge_abort(self):
         return self.both(lambda: mg.abort(self.ours), "merge", "--abort")
@@ -142,7 +146,7 @@ class Twin:
         return go.git(d, "status", "--porcelain=v1", "-z", "--no-renames", "-uall").decode("utf-8", "surrogateescape").split("\x00")
 
     def our_status_z(self, untracked="all"):
-        s = self.ours.status(untracked=untracked)
+        s = self.ours.status(untracked=untracked, renames=False)               # the oracle runs with --no-renames
         return ["%s%s %s" % (x, y, p) for x, y, p in s.entries] + ["?? " + p for p in s.untracked] + [""]
 
     @staticmethod
