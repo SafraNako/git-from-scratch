@@ -120,7 +120,12 @@ def test_push_new_branch_fast_forward_force_and_delete(rt):
     assert g[0] == k[0] == 0, (g, k)
     rt.assert_same("push --delete", upstream=True)
     g, k = rt.both("push")
-    assert g[0] == k[0] == 0 and rt.norm(g[2], "g") == rt.norm(k[2], "k").replace("kgit", "git"), (g, k)
+    assert g[0] == k[0] == 0 and no_hints(rt.norm(g[2], "g")) == no_hints(rt.norm(k[2], "k").replace("kgit", "git")), (g, k)
+
+
+def no_hints(text):
+    """git words its ``hint:`` lines differently from one release to the next; everything else must match."""
+    return "".join(line + "\n" for line in text.splitlines() if not line.startswith("hint:"))
 
 
 def same_output(rt, *args, normalise=True):
@@ -201,27 +206,27 @@ def test_push_variants(rt):
         go.git(d, "tag", "lt1")
         go.git(d, "tag", "-a", "an1", "-m", "annotated one", extra={"GIT_COMMITTER_DATE": "1700000601 +0000"})
     g, k = rt.both("push", "--tags")
-    assert g[0] == k[0] == 0 and rt.norm(g[2], "g") == rt.norm(k[2], "k").replace("kgit", "git"), (g, k)
+    assert g[0] == k[0] == 0 and no_hints(rt.norm(g[2], "g")) == no_hints(rt.norm(k[2], "k").replace("kgit", "git")), (g, k)
     rt.assert_same("after push --tags", upstream=True)
     g, k = rt.both("push", "origin", "main:refs/heads/renamed")
-    assert g[0] == k[0] == 0 and rt.norm(g[2], "g") == rt.norm(k[2], "k").replace("kgit", "git"), (g, k)
+    assert g[0] == k[0] == 0 and no_hints(rt.norm(g[2], "g")) == no_hints(rt.norm(k[2], "k").replace("kgit", "git")), (g, k)
     rt.assert_same("after pushing to another name", upstream=True)
     # upstream moves on; a push must be refused (fetch first), after a fetch it is a non-fast-forward, with --force it goes through
     rt.feed(lambda d: commit_file(d, "other.txt", "other\n", "upstream", 1700000700))
     commit_both("two.txt", "two", 1700000800)
     g, k = rt.both("push")
-    assert g[0] == k[0] == 1 and rt.norm(g[2], "g") == rt.norm(k[2], "k").replace("kgit", "git"), (g, k)
+    assert g[0] == k[0] == 1 and no_hints(rt.norm(g[2], "g")) == no_hints(rt.norm(k[2], "k").replace("kgit", "git")), (g, k)
     rt.both("fetch")
     g, k = rt.both("push")
-    assert g[0] == k[0] == 1 and rt.norm(g[2], "g") == rt.norm(k[2], "k").replace("kgit", "git"), (g, k)
+    assert g[0] == k[0] == 1 and no_hints(rt.norm(g[2], "g")) == no_hints(rt.norm(k[2], "k").replace("kgit", "git")), (g, k)
     rt.assert_same("after the refused pushes", upstream=True)
     g, k = rt.both("push", "--force")
-    assert g[0] == k[0] == 0 and rt.norm(g[2], "g") == rt.norm(k[2], "k").replace("kgit", "git"), (g, k)
+    assert g[0] == k[0] == 0 and no_hints(rt.norm(g[2], "g")) == no_hints(rt.norm(k[2], "k").replace("kgit", "git")), (g, k)
     rt.assert_same("after the forced push", upstream=True)
     g, k = rt.both("push", "origin", ":renamed")                      # the feeder's mirror push already removed it
-    assert g[0] == k[0] == 1 and rt.norm(g[2], "g") == rt.norm(k[2], "k").replace("kgit", "git"), (g, k)
+    assert g[0] == k[0] == 1 and no_hints(rt.norm(g[2], "g")) == no_hints(rt.norm(k[2], "k").replace("kgit", "git")), (g, k)
     g, k = rt.both("push", "origin", ":dev")
-    assert g[0] == k[0] == 0 and rt.norm(g[2], "g") == rt.norm(k[2], "k").replace("kgit", "git"), (g, k)
+    assert g[0] == k[0] == 0 and no_hints(rt.norm(g[2], "g")) == no_hints(rt.norm(k[2], "k").replace("kgit", "git")), (g, k)
     rt.assert_same("after deleting through :ref", upstream=True)
 
 
@@ -324,3 +329,13 @@ def test_cloning_an_empty_repository_and_a_detached_head(tmp_path):
         assert go.gits(d, "rev-parse", "HEAD") == go.gits(src, "rev-parse", "HEAD")
         assert go.git(d, "symbolic-ref", "-q", "HEAD", check=False).returncode == 1
     assert sorted(os.listdir(os.path.join(root, "k_det"))) == sorted(os.listdir(os.path.join(root, "g_det")))
+
+
+def test_renaming_and_removing_the_remote_that_a_clone_follows(rt):
+    rt.clone()
+    g, k = rt.both("remote", "rename", "origin", "upstream")
+    assert g[0] == k[0] == 0, (g, k)
+    rt.assert_same("after renaming origin")
+    g, k = rt.both("remote", "remove", "upstream")
+    assert g[0] == k[0] == 0, (g, k)
+    rt.assert_same("after removing the remote")

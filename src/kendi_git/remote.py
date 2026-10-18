@@ -81,7 +81,7 @@ def remote_fetch_specs(repo, name):
 def add_remote(repo, name, url, fetch_specs=None):
     if name in remote_names(repo):
         raise GitError("remote %s already exists." % name)
-    if not name or "/" in name.strip("/") and False:
+    if not name or name.startswith("-") or any(c in name for c in " \t\n:~^?*[\\"):
         raise GitError("'%s' is not a valid remote name" % name)
     cfg = repo.config.local
     cfg.set("remote.%s.url" % name, url)
@@ -123,9 +123,19 @@ def rename_remote(repo, old, new):
     cfg.save()
     for ref, oid in repo.refs.list("refs/remotes/%s/" % old):
         newref = "refs/remotes/%s/%s" % (new, ref[len("refs/remotes/%s/" % old):])
+        raw = repo.refs.read_raw(ref)
+        entry = repo.log_entry("remote: renamed %s to %s" % (ref, newref))
+        if raw and raw[0] == "sym":                                   # origin/HEAD keeps pointing at its branch, under the new name, with a fresh log
+            repo.refs.set_symbolic(newref, raw[1].replace("refs/remotes/%s/" % old, "refs/remotes/%s/" % new, 1))
+            repo.refs.delete(ref)
+            if entry:
+                repo.refs.append_log(newref, ZERO, oid, *entry)
+            continue
         repo.refs.update(newref, oid)
-        repo.refs.move_log(ref, newref) if hasattr(repo.refs, "move_log") else None
+        repo.refs.move_log(ref, newref)
         repo.refs.delete(ref)
+        if entry:
+            repo.refs.append_log(newref, oid, oid, *entry)
 
 
 def resolve_url(repo, url):
@@ -405,7 +415,7 @@ def _apply(repo, wanted, remote_refs, result, url, action, cloning=False):
         summaries.append((flag, summary, what, dest, "(forced update)" if flag == "+" else ""))
     if summaries:
         lines.append("From " + shown)
-        width = 2 * len(repo.odb.abbrev(summaries[0][2] if False else "0" * 40)) + 3
+        width = 2 * len(repo.odb.abbrev("0" * 40)) + 3
         refcol = max([10] + [len(s[2]) for s in summaries])
         for flag, summary, src, dst, note in summaries:
             lines.append(" %s %s %s -> %s%s" % (flag, summary.ljust(width), src.ljust(refcol), dst, "  " + note if note else ""))
@@ -699,7 +709,7 @@ def clone(url, directory=None, bare=False, branch=None, origin="origin", checkou
             specs = [Refspec("refs/heads/*", "refs/heads/*", True)]
         else:
             cfg.add("remote.%s.fetch" % origin, "+refs/heads/*:refs/remotes/%s/*" % origin)
-            specs = remote_fetch_specs(Repo(repo.gitdir, repo.worktree, env=env), origin) if False else [Refspec("refs/heads/*", "refs/remotes/%s/*" % origin, True)]
+            specs = [Refspec("refs/heads/*", "refs/remotes/%s/*" % origin, True)]
         cfg.save()
         repo = Repo(repo.gitdir, repo.worktree, env=env, now=now)
         fetch(repo, origin, tags=True, cloning=True, specs=specs, url=url)
