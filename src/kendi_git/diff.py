@@ -556,6 +556,27 @@ class Side:
 
 
 @dataclass
+class RenamedSide(Side):
+    """The old side of a rename: where the file was (``path``) and how similar the two contents are (``score``, out of 60000)."""
+    path: str = ""
+    score: int = 0
+
+    @property
+    def similarity(self):
+        return self.score * 100 // 60000
+
+
+@dataclass
+class Unmerged:
+    """Stands in for the ``old`` side of a change on a path with conflicts: ``stages`` maps 1, 2, 3 to ``(mode, oid)``; ``worktree`` is the ``Side`` of the file on disk (or
+    None); ``cached`` is true for ``diff --cached``, which has no work-tree side."""
+    stages: dict
+    worktree: object = None
+    cached: bool = False
+    stage: int = 0            # --base/--ours/--theirs: compare with that stage instead of making a combined diff
+
+
+@dataclass
 class Change:
     path: str
     old: object            # Side or None
@@ -569,6 +590,36 @@ def quote_path(path, space=False):
         return raw.decode("ascii")
     esc = {7: "\\a", 8: "\\b", 9: "\\t", 10: "\\n", 11: "\\v", 12: "\\f", 13: "\\r", 34: '\\"', 92: "\\\\"}
     return '"' + "".join(esc.get(c) or (chr(c) if 0x20 <= c < 0x7f else "\\%03o" % c) for c in raw) + '"'
+
+
+def rename_label(a, b):
+    """git's ``pprint_rename``: ``dir/{old => new}/file`` with the common leading and trailing directories factored out."""
+    if quote_path(a) != a or quote_path(b) != b:
+        return quote_path(a) + " => " + quote_path(b)
+    len_a, len_b = len(a), len(b)
+    pfx = 0
+    i = 0
+    while i < len_a and i < len_b and a[i] == b[i]:
+        if a[i] == "/":
+            pfx = i + 1
+        i += 1
+    sfx = 0
+    adjust = 1 if pfx else 0
+    i, j = len_a, len_b                                  # one past the end: the terminating NUL compares equal on both sides
+    while pfx - adjust <= i and pfx - adjust <= j and (a[i:i + 1] == b[j:j + 1]):
+        if a[i:i + 1] == "/":
+            sfx = len_a - i
+        i -= 1
+        j -= 1
+    a_mid = max(len_a - pfx - sfx, 0)
+    b_mid = max(len_b - pfx - sfx, 0)
+    out = ""
+    if pfx + sfx:
+        out += a[:pfx] + "{"
+    out += a[pfx:pfx + a_mid] + " => " + b[pfx:pfx + b_mid]
+    if pfx + sfx:
+        out += "}" + a[len_a - sfx:]
+    return out
 
 
 def is_binary(data):
@@ -593,7 +644,8 @@ def diff_flat(old, new):
 
 def render_change(path, old, new, abbrev, context=3, a_prefix="a/", b_prefix="b/"):
     """The patch text of one change. ``old`` and ``new`` are ``Side`` objects or ``None``; ``abbrev`` shortens an object id for the ``index`` line."""
-    qa, qb = quote_path(a_prefix + path), quote_path(b_prefix + path)
+    renamed = isinstance(old, RenamedSide)
+    qa, qb = quote_path(a_prefix + (old.path if renamed else path)), quote_path(b_prefix + path)
     head = [b"diff --git %s %s\n" % (qa.encode(), qb.encode())]
     if old is None:
         head.append(b"new file mode %06o\n" % new.mode)
@@ -601,6 +653,8 @@ def render_change(path, old, new, abbrev, context=3, a_prefix="a/", b_prefix="b/
         head.append(b"deleted file mode %06o\n" % old.mode)
     elif old.mode != new.mode:
         head.append(b"old mode %06o\nnew mode %06o\n" % (old.mode, new.mode))
+    if renamed:
+        head.append(b"similarity index %d%%\nrename from %s\nrename to %s\n" % (old.similarity, quote_path(old.path).encode(), quote_path(path).encode()))
     old_oid = old.oid if old else NULL_OID
     new_oid = new.oid if new else NULL_OID
     if old_oid != new_oid:
@@ -617,7 +671,7 @@ def render_change(path, old, new, abbrev, context=3, a_prefix="a/", b_prefix="b/
         right = b"/dev/null" if new is None else qb.encode()
         return b"".join(head) + b"Binary files %s and %s differ\n" % (left, right)
     tab = b"\t" if " " in path else b""
-    left = b"/dev/null" if old is None else qa.encode() + tab
+    left = b"/dev/null" if old is None else qa.encode() + (b"\t" if renamed and " " in old.path else tab)
     right = b"/dev/null" if new is None else qb.encode() + tab
     head.append(b"--- %s\n+++ %s\n" % (left, right))
     return b"".join(head) + format_hunks(split_lines(a_data), split_lines(b_data), context)
@@ -672,11 +726,12 @@ def stat_rows(changes):
     for path, old, new in merge_typechanges(changes):
         a_data = old.bytes() if old else b""
         b_data = new.bytes() if new else b""
+        name = rename_label(old.path, path) if isinstance(old, RenamedSide) else quote_path(path)
         if is_binary(a_data) or is_binary(b_data):
-            rows.append((quote_path(path), len(b_data), len(a_data), True))
+            rows.append((name, len(b_data), len(a_data), True))
         else:
             c = counts(old, new)
-            rows.append((quote_path(path), c[0], c[1], False))
+            rows.append((name, c[0], c[1], False))
     return rows
 
 
@@ -772,6 +827,10 @@ def format_summary(changes):
             out.append(" create mode %06o %s\n" % (new.mode, q))
         elif new is None:
             out.append(" delete mode %06o %s\n" % (old.mode, q))
+        elif isinstance(old, RenamedSide):
+            out.append(" rename %s (%d%%)\n" % (rename_label(old.path, path), old.similarity))
+            if old.mode != new.mode:
+                out.append(" mode change %06o => %06o\n" % (old.mode, new.mode))             # no name: the rename line already gave it
         elif old.mode != new.mode:
             out.append(" mode change %06o => %06o %s\n" % (old.mode, new.mode, q))
     return "".join(out)

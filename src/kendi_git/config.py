@@ -162,6 +162,67 @@ class ConfigFile:
                 self.lines += [header, new_line]
         self.items = self._parse()
 
+    def add(self, key, value):
+        """Append one more value for a variable that may occur several times (``git config --add``)."""
+        section, sub, name = self.split_key(key)
+        if not _NAME.fullmatch(name):
+            raise GitError(f"invalid variable name '{name}'")
+        new_line = f"\t{name} = {self.quote(value)}"
+        in_section = [it for it in self.items if (it[0], it[1]) == (section, sub)]
+        if in_section:
+            self.lines.insert(in_section[-1][5] + 1, new_line)
+        else:
+            header = f"[{section}]" if sub is None else '[%s "%s"]' % (section, sub.replace("\\", "\\\\").replace('"', '\\"'))
+            self.lines += [header, new_line]
+        self.items = self._parse()
+
+    def unset(self, key):
+        """Remove every occurrence of a variable (``git config --unset-all``); returns whether there was one."""
+        section, sub, name = self.split_key(key)
+        found = [it for it in self.items if (it[0], it[1], it[2]) == (section, sub, name)]
+        for it in sorted(found, key=lambda t: t[4], reverse=True):
+            del self.lines[it[4]:it[5] + 1]
+        self.items = self._parse()
+        return bool(found)
+
+    def _section_spans(self, section, sub):
+        """Line ranges ``(first, end)`` of the sections named ``section`` / ``sub``: from the header up to the next header."""
+        spans, start = [], None
+        for i, line in enumerate(self.lines + ["["]):
+            text = line.strip()
+            if text.startswith("["):
+                if start is not None:
+                    spans.append((start, i))
+                    start = None
+                m = _SECTION.match(text)
+                if m:
+                    name, subname = m.group(1).lower(), m.group(2)
+                    if subname is not None:
+                        subname = re.sub(r"\\(.)", r"\1", subname)
+                    elif "." in name:
+                        name, subname = name.split(".", 1)
+                    if name == section and subname == sub:
+                        start = i
+        return spans
+
+    def has_section(self, section, sub=None):
+        return bool(self._section_spans(section.lower(), sub))
+
+    def remove_section(self, section, sub=None):
+        """Delete a whole section with its variables; returns whether it existed."""
+        spans = self._section_spans(section.lower(), sub)
+        for first, end in reversed(spans):
+            del self.lines[first:end]
+        self.items = self._parse()
+        return bool(spans)
+
+    def rename_section(self, section, sub, new_sub):
+        spans = self._section_spans(section.lower(), sub)
+        for first, _end in spans:
+            self.lines[first] = '[%s "%s"]' % (section, new_sub.replace("\\", "\\\\").replace('"', '\\"'))
+        self.items = self._parse()
+        return bool(spans)
+
     def save(self):
         if not self.path:
             raise GitError("this configuration has no file to save to")

@@ -3,9 +3,9 @@
 What is implemented: the common ancestors of two commits, the line-level merge rule of git's xdiff (two changes conflict when they overlap *or touch*, unless they are
 the same change), a tree merge by path (one side unchanged: take the other; both changed: merge the text; modes merged independently) and the fast-forward / true merge
 of a branch into the current one; a conflicted merge is left the way git leaves it (conflict markers in the files, the three stages in the index, ``MERGE_HEAD`` and
-``MERGE_MSG``) and can be concluded with ``commit`` or undone with ``abort``. What is not done: rename detection (a rename on one side plus an edit on the other is a
-conflict, where git merges it), merging more than one common ancestor (criss-cross histories are refused) and the exotic conflicts (symlinks, submodules, a file against
-a directory), which are refused before anything is touched.
+``MERGE_MSG``) and can be concluded with ``commit`` or undone with ``abort``. A file one side moved and the other changed is followed to its new path (rename/modify,
+rename/delete and the two-sides cases). What is not done: directory rename detection, merging more than one common ancestor (criss-cross histories are refused) and the
+exotic conflicts (symlinks, submodules, a file against a directory, renames that collide with other changes), which are refused before anything is touched.
 """
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ import os
 from dataclasses import dataclass
 
 from . import checkout as co
+from . import diff as df
 from . import index as ix
+from . import rename as rn
 from .diff import is_binary, myers, split_lines
 from .errors import GitError
 from .objects import MODE_EXEC, MODE_FILE
@@ -243,8 +245,9 @@ def _blob(repo, entry):
     return repo.odb.read(entry[1])[1] if entry else b""
 
 
-def merge_entry_full(repo, path, base, ours, theirs, names):
-    """Merge one path's three versions (each ``(mode, oid)`` or ``None``). Returns ``(merged entry or None, Conflict or None, auto_merged)``."""
+def merge_entry_full(repo, path, base, ours, theirs, names, labels=None):
+    """Merge one path's three versions (each ``(mode, oid)`` or ``None``). Returns ``(merged entry or None, Conflict or None, auto_merged)``. ``labels`` replaces the
+    names in the conflict markers (git adds ``:path`` to them when the file was renamed)."""
     if ours == theirs:
         return ours, None, False
     if base == ours:
@@ -278,27 +281,112 @@ def merge_entry_full(repo, path, base, ours, theirs, names):
         return (mode, ours[1]), None, False
     data = [_blob(repo, v) for v in (base, ours, theirs)]
     stages = {1: base, 2: ours, 3: theirs} if base is not None else {2: ours, 3: theirs}
+    l1, l2 = labels or (n1, n2)
     if any(is_binary(d) for d in data):
-        return ours, Conflict(path, "binary", stages, ours, "Cannot merge binary files: %s (%s vs. %s)" % (path, n1, n2)), True
-    lines, conflicts = xdl_merge(split_lines(data[0]), split_lines(data[1]), split_lines(data[2]), n1, n2)
+        return ours, Conflict(path, "binary", stages, ours, "Cannot merge binary files: %s (%s vs. %s)" % (path, l1, l2)), True
+    lines, conflicts = xdl_merge(split_lines(data[0]), split_lines(data[1]), split_lines(data[2]), l1, l2)
     entry = (mode, repo.odb.write("blob", b"".join(lines)))
     if not conflicts:
         return entry, None, True
     return entry, Conflict(path, "content" if base is not None else "add/add", stages, entry), True
 
 
+def _side_renames(repo, base, side, other, everything=False):
+    """``{old path: (new path, score)}`` for the files ``side`` moved away from ``base``. Like git's merge, only sources the other side also changed or deleted are
+    looked at (a rename of a file nobody else touched merges the same either way)."""
+    relevant = None if everything else {p for p in base if other.get(p) != base.get(p)}
+    if relevant is not None and not relevant:
+        return {}
+    changes = [(path, repo._blob_side(*o) if o else None, repo._blob_side(*n) if n else None) for path, o, n in df.diff_flat(base, side)]
+    out = {}
+    for path, old, _new in rn.detect_renames(changes, minimum_score=rn.DEFAULT_MINIMUM_SCORE, rename_limit=rn.DEFAULT_RENAME_LIMIT, relevant=relevant, rename_empty=False):
+        if isinstance(old, df.RenamedSide):
+            out[old.path] = (path, old.score)
+    return out
+
+
+def _directory_rename_guard(repo, base, ours, theirs):
+    """Git moves files that one side adds to a directory the other side renamed (or reports a conflict about it); this program does not, so it stops when that could
+    be at play: a directory that disappeared on one side by renames while the other side added a file to it."""
+    for side, other, who in ((ours, theirs, "HEAD"), (theirs, ours, "the merged branch")):
+        base_dirs = {}
+        for p in base:
+            d = p.rsplit("/", 1)[0] if "/" in p else None
+            while d:
+                base_dirs.setdefault(d, 0)
+                d = d.rsplit("/", 1)[0] if "/" in d else None
+        gone = [d for d in base_dirs if not any(p.startswith(d + "/") for p in side)]
+        if not gone:
+            continue
+        added = [p for p in other if p not in base and p not in side]
+        suspects = [d for d in gone if any(p.startswith(d + "/") for p in added)]
+        if not suspects:
+            continue
+        for old, (new, _s) in _side_renames(repo, base, side, other, everything=True).items():
+            if any(old.startswith(d + "/") for d in suspects) and old.rsplit("/", 1)[0] != new.rsplit("/", 1)[0]:
+                raise GitError("%s moved a directory that the other side added files to; directory rename detection is not implemented" % who)
+
+
 def merge_trees_full(repo, base, ours, theirs, names=("HEAD", "theirs")):
     """Three-way merge of ``{path: (mode, oid)}`` snapshots. Returns ``(merged, conflicts, auto_merged)``: ``merged`` the settled paths, ``conflicts`` a list of
-    ``Conflict`` and ``auto_merged`` the paths whose contents had to be merged line by line."""
+    ``Conflict`` and ``auto_merged`` the paths whose contents had to be merged line by line. A file one side moved and the other changed is merged at its new path."""
+    n1, n2 = names
+    r1 = _side_renames(repo, base, ours, theirs)
+    r2 = _side_renames(repo, base, theirs, ours)
+    special, gone, extra = {}, set(), []                      # new path -> (base, ours, theirs, labels); old paths to leave out; ready-made conflicts
+    _directory_rename_guard(repo, base, ours, theirs)
+    for old in sorted(set(r1) | set(r2)):
+        b = base[old]
+        if old in r1 and old in r2:
+            a, c = r1[old][0], r2[old][0]
+            if a == c:
+                special[a] = (b, ours.get(a), theirs.get(a), None)                 # both sides use the same name: the markers carry no path
+            else:                                              # renamed to two different names: a rename/rename conflict
+                if ours.get(a) != b or theirs.get(c) != b or a in theirs or c in ours:
+                    raise GitError("%s was renamed on both sides to different names and changed; this program does not merge that" % old)
+                extra.append(Conflict(old, "rename/rename", {1: b}, None, "%s renamed to %s in %s and to %s in %s." % (old, a, n1, c, n2)))
+                extra.append(Conflict(a, "rename/rename", {2: ours[a]}, ours[a], ""))
+                extra.append(Conflict(c, "rename/rename", {3: theirs[c]}, theirs[c], ""))
+            gone.add(old)
+        elif old in r1:
+            new = r1[old][0]
+            if new in theirs:
+                raise GitError("%s was renamed to %s on one side, but the other side has that path too; this program does not merge that" % (old, new))
+            other = theirs.get(old)
+            gone.add(old)
+            if other is None:
+                extra.extend(_rename_delete(new, b, ours[new], 2, "%s renamed to %s in %s, but deleted in %s." % (old, new, n1, n2), n1, n2))
+            else:
+                special[new] = (b, ours[new], other, ("%s:%s" % (n1, new), "%s:%s" % (n2, old)))
+        else:
+            new = r2[old][0]
+            if new in ours:
+                raise GitError("%s was renamed to %s on one side, but the other side has that path too; this program does not merge that" % (old, new))
+            other = ours.get(old)
+            gone.add(old)
+            if other is None:
+                extra.extend(_rename_delete(new, b, theirs[new], 3, "%s renamed to %s in %s, but deleted in %s." % (old, new, n2, n1), n2, n1))
+            else:
+                special[new] = (b, other, theirs[new], ("%s:%s" % (n1, old), "%s:%s" % (n2, new)))
     merged, conflicts, auto = {}, [], []
-    for path in sorted(set(base) | set(ours) | set(theirs), key=lambda p: p.encode("utf-8", "surrogateescape")):
-        entry, conflict, was_auto = merge_entry_full(repo, path, base.get(path), ours.get(path), theirs.get(path), names)
+    done = {c.path for c in extra}
+    for path in sorted(set(base) | set(ours) | set(theirs) | set(special), key=lambda p: p.encode("utf-8", "surrogateescape")):
+        if path in gone and path not in special and path not in done:
+            continue
+        if path in done:
+            continue
+        if path in special:
+            b, o, t, labels = special[path]
+            entry, conflict, was_auto = merge_entry_full(repo, path, b, o, t, names, labels)
+        else:
+            entry, conflict, was_auto = merge_entry_full(repo, path, base.get(path), ours.get(path), theirs.get(path), names)
         if was_auto:
             auto.append(path)
         if conflict:
             conflicts.append(conflict)
         elif entry is not None:
             merged[path] = entry
+    conflicts = sorted(conflicts + _group(extra), key=lambda c: c.path.encode("utf-8", "surrogateescape"))
     for path in list(merged) + [c.path for c in conflicts]:                  # a path cannot be a file and a directory at once
         parts = path.split("/")
         for i in range(1, len(parts)):
@@ -306,6 +394,27 @@ def merge_trees_full(repo, base, ours, theirs, names=("HEAD", "theirs")):
             if parent in merged or any(c.path == parent for c in conflicts):
                 raise GitError("a file and a directory with the same name (%s) were added on different sides; this program does not merge that" % parent)
     return merged, conflicts, auto
+
+
+def _rename_delete(new, base, renamed, stage, message, who, other):
+    """A file one side renamed and the other deleted: stage 1 is what it was, the renamed version sits at the new path, in the index and in the work tree."""
+    out = [Conflict(new, "rename/delete", {1: base, stage: renamed}, renamed, message)]
+    if renamed != base:
+        out.append(Conflict(new, "modify/delete", {}, renamed, "%s deleted in %s and modified in %s.  Version %s of %s left in tree." % (new, other, who, who, new)))
+    return out
+
+
+def _group(extra):
+    """One conflict per path: the entries made for the same path (a rename/delete that is also a modify/delete) become one with all their messages."""
+    by_path, order = {}, []
+    for c in extra:
+        if c.path in by_path:
+            first = by_path[c.path]
+            first.detail = first.detail + "\n" + c.detail if c.detail else first.detail
+        else:
+            by_path[c.path] = c
+            order.append(c.path)
+    return [by_path[p] for p in order]
 
 
 def merge_trees(repo, base, ours, theirs):
@@ -363,16 +472,17 @@ def _write_state(repo, name, text):
         f.write(text)
 
 
-def merge(repo, spec, message=None, ff="allow"):
+def merge(repo, spec, message=None, ff="allow", reflog_action=None):
     if ff not in ("allow", "never", "only"):
         raise GitError(f"unknown fast-forward mode '{ff}'")
     if merge_in_progress(repo):
         raise GitError("you have not concluded your merge (MERGE_HEAD exists): commit the result, or run 'merge --abort'")
     target = repo.commit_of(spec)
     head = repo.refs.head_oid()
+    action = reflog_action or "merge %s" % spec
     if head is None:                                       # merging into an unborn branch just checks the commit out
         co.apply_switch(repo, {}, co.snapshot_of_commit(repo, target))
-        _advance(repo, target, None, "merge %s: Fast-forward" % spec)
+        _advance(repo, target, None, "%s: Fast-forward" % action)
         return MergeResult("fast-forward", target, None)
     if target == head or target in ancestors(repo, head):
         return MergeResult("up-to-date", head, head)
@@ -380,7 +490,7 @@ def merge(repo, spec, message=None, ff="allow"):
     if head in ancestors(repo, target) and ff != "never":
         co.apply_switch(repo, old_files, co.snapshot_of_commit(repo, target))
         repo.refs._write_locked("ORIG_HEAD", head)
-        _advance(repo, target, head, "merge %s: Fast-forward" % spec)
+        _advance(repo, target, head, "%s: Fast-forward" % action)
         return MergeResult("fast-forward", target, head)
     if ff == "only":
         raise GitError("not possible to fast-forward, aborting")
@@ -393,7 +503,7 @@ def merge(repo, spec, message=None, ff="allow"):
     if any(stage for _p, stage in index.entries):
         raise GitError("you have unmerged paths: finish resolving them first")
     if repo.index_files(index) != old_files:
-        entry = repo.log_entry("merge %s: updating HEAD" % spec)           # git logs this no-op update before it gives up on a dirty index
+        entry = repo.log_entry("%s: updating HEAD" % action)           # git logs this no-op update before it gives up on a dirty index
         if entry:
             repo.refs.append_log("HEAD", head, head, *entry)
         raise GitError("your index has changes that are not committed: commit or reset them before merging")
@@ -417,11 +527,14 @@ def merge(repo, spec, message=None, ff="allow"):
         _write_state(repo, "MERGE_MODE", "no-ff" if ff == "never" else "")
         _write_state(repo, "MERGE_MSG", text.rstrip("\n") + "\n\n# Conflicts:\n" + "".join("#\t%s\n" % c.path for c in conflicts))
         for c in conflicts:
-            notes.append(("conflict", c.path, c.detail if c.kind in ("modify/delete", "binary") else "Merge conflict in " + c.path))
+            if c.kind in ("modify/delete", "binary", "rename/delete", "rename/rename"):
+                notes.extend(("conflict", c.path, line) for line in c.detail.split("\n") if line)
+            else:
+                notes.append(("conflict", c.path, "Merge conflict in " + c.path))
         return MergeResult("conflict", head, head, conflicts, notes)
     tree = ix.write_tree(repo.odb, merged)
     oid = repo.make_commit(tree, [head, target], text)
-    _advance(repo, oid, head, "merge %s: Merge made by the 'ort' strategy." % spec)
+    _advance(repo, oid, head, "%s: Merge made by the 'ort' strategy." % action)
     return MergeResult("merge", oid, head, None, notes)
 
 

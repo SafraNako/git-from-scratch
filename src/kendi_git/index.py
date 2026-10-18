@@ -171,6 +171,18 @@ class Index:
             raise GitError("the index contains unresolved conflicts")
         return sorted((e for e in self.entries.values()), key=IndexEntry.key)
 
+    def zero_entries(self):
+        """Entries at stage 0 sorted by path bytes, ignoring the ones that are in conflict."""
+        return sorted((e for e in self.entries.values() if not e.stage), key=IndexEntry.key)
+
+    def unmerged(self):
+        """``{path: {stage: entry}}`` for the paths with conflicts."""
+        out = {}
+        for (path, stage), e in self.entries.items():
+            if stage:
+                out.setdefault(path, {})[stage] = e
+        return out
+
     def get(self, path):
         return self.entries.get((path, 0))
 

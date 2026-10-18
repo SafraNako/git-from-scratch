@@ -14,12 +14,14 @@ import stat as statmod
 import time
 from dataclasses import dataclass, field
 
+from . import combine as cb
 from . import diff as df
 from . import index as ix
+from . import rename as rn
 from .config import Config, identity
 from .errors import GitError
 from .ignore import IgnoreRules, translate
-from .objects import EMPTY_TREE, MODE_EXEC, MODE_FILE, MODE_GITLINK, MODE_LINK, MODE_TREE, Commit, Tag, clean_message, hash_object, is_oid, parse_tree
+from .objects import EMPTY_TREE, NULL_OID, MODE_EXEC, MODE_FILE, MODE_GITLINK, MODE_LINK, MODE_TREE, Commit, Tag, clean_message, hash_object, is_oid, parse_tree
 from .odb import ObjectDB
 from .refs import RefStore, check_branch_name, check_ref_format
 
@@ -98,13 +100,14 @@ class Status:
     ignored: list = field(default_factory=list)
     branch: object = None                                # branch name, or None when HEAD is detached
     head: object = None                                  # commit id or None (unborn)
+    renames: dict = field(default_factory=dict)          # new path -> old path, for the entries whose X is "R"
 
     def porcelain_lines(self, quote=True, prefix=""):
         """``XY path`` lines. ``prefix`` (the current directory relative to the repository root) makes the paths relative to it, as ``git status -s`` prints them;
         ``--porcelain`` output is always relative to the root."""
         q = (lambda p: df.quote_path(p, space=True)) if quote else (lambda p: p)
         rel = (lambda p: relative_to(p, prefix))
-        out = ["%s%s %s" % (x, y, q(rel(p))) for x, y, p in self.entries]
+        out = ["%s%s %s%s" % (x, y, q(rel(self.renames[p])) + " -> " if p in self.renames else "", q(rel(p))) for x, y, p in self.entries]
         out += ["?? " + q(rel(p)) for p in self.untracked]
         return out
 
@@ -128,20 +131,21 @@ def sort_key(path):
 class Repo:
     def __init__(self, gitdir, worktree, env=None, now=None):
         self.gitdir = os.path.abspath(gitdir)
-        self.worktree = os.path.abspath(worktree)
+        self.worktree = os.path.abspath(worktree) if worktree else None            # None: a bare repository
+        self.bare = worktree is None
         self.env = dict(os.environ if env is None else env)
         self.now = now
         self.odb = ObjectDB(os.path.join(self.gitdir, "objects"))
         self.config = Config(self.gitdir, env=self.env)
-        self.refs = RefStore(self.gitdir, log_all=self.config.get_bool("core.logAllRefUpdates", True))
+        self.refs = RefStore(self.gitdir, log_all=self.config.get_bool("core.logAllRefUpdates", not self.bare))
         self._commits = {}
         self._shallow = None
 
     # --- creating and finding ------------------------------------------------------------------------------------------------------------------
     @staticmethod
-    def init(path, branch="main", env=None, now=None):
+    def init(path, branch="main", env=None, now=None, bare=False):
         path = os.path.abspath(path)
-        gitdir = os.path.join(path, ".git")
+        gitdir = path if bare else os.path.join(path, ".git")
         existing = os.path.isdir(os.path.join(gitdir, "objects")) and os.path.exists(os.path.join(gitdir, "HEAD"))
         if not check_branch_name(branch):
             raise GitError(f"'{branch}' is not a valid branch name")
@@ -153,7 +157,7 @@ class Repo:
         if not existing:
             with open(os.path.join(gitdir, "HEAD"), "w") as f:
                 f.write(HEAD_TEMPLATE % branch)
-            core = ["\trepositoryformatversion = 0", "\tfilemode = true", "\tbare = false", "\tlogallrefupdates = true"]
+            core = ["\trepositoryformatversion = 0", "\tfilemode = true", "\tbare = true" if bare else "\tbare = false"] + ([] if bare else ["\tlogallrefupdates = true"])
             if _case_insensitive(gitdir):
                 core.append("\tignorecase = true")
             with open(os.path.join(gitdir, "config"), "w") as f:
@@ -164,7 +168,7 @@ class Repo:
                         "# *.[oa]\n# *~\n")
             with open(os.path.join(gitdir, "description"), "w") as f:
                 f.write("Unnamed repository; edit this file 'description' to name the repository.\n")
-        return Repo(gitdir, path, env=env, now=now)
+        return Repo(gitdir, None if bare else path, env=env, now=now)
 
     @staticmethod
     def discover(start=None, env=None, now=None):
@@ -175,6 +179,8 @@ class Repo:
             return Repo(gitdir, tree, env=env, now=now)
         cur = os.path.abspath(start or os.getcwd())
         while True:
+            if os.path.isfile(os.path.join(cur, "HEAD")) and os.path.isdir(os.path.join(cur, "objects")) and os.path.isdir(os.path.join(cur, "refs")):
+                return Repo(cur, None, env=env, now=now)                  # a bare repository: the directory is the git directory
             dot = os.path.join(cur, ".git")
             if os.path.isdir(dot) and os.path.exists(os.path.join(dot, "HEAD")):
                 return Repo(dot, cur, env=env, now=now)
@@ -212,6 +218,8 @@ class Repo:
 
     def rel_cwd(self, cwd=None):
         """The current directory relative to the work tree root (``""`` at the root)."""
+        if self.worktree is None:
+            return ""
         cwd = os.path.realpath(cwd or os.getcwd())
         root = os.path.realpath(self.worktree)
         if cwd == root:
@@ -513,6 +521,7 @@ class Repo:
         for (path, stage), e in index.entries.items():
             by_path.setdefault(path, {})[stage] = e
         entries = []
+        deleted, added = {}, {}                          # staged deletions and additions: candidates for rename detection
         for path in sorted(set(by_path) | set(head_files), key=sort_key):
             stages = by_path.get(path, {})
             h = head_files.get(path)
@@ -536,9 +545,23 @@ class Repo:
                 elif not self._entry_unchanged(e, path, st, index):
                     wt_mode = self.worktree_mode(st, e.mode) if (statmod.S_ISREG(st.st_mode) or statmod.S_ISLNK(st.st_mode)) else None
                     y = "T" if wt_mode is not None and (wt_mode == MODE_LINK) != (e.mode == MODE_LINK) else "M"
+            if x == "D":
+                deleted[path] = h
+            elif x == "A":
+                added[path] = e
             if (x, y) != (" ", " "):
                 entries.append((x, y, path))
-        s = Status(entries=entries, branch=self.refs.current_branch(), head=head)
+        renames = {}
+        if deleted and added:
+            changes = [(p, self._blob_side(*h), None) for p, h in deleted.items()] + [(p, None, self._blob_side(e.mode, e.oid)) for p, e in added.items()]
+            changes.sort(key=lambda c: sort_key(c[0]))
+            for path, old_side, _new in self.detect_renames(changes, rn.DEFAULT_MINIMUM_SCORE):
+                if isinstance(old_side, df.RenamedSide):
+                    renames[path] = old_side.path
+        if renames:
+            gone = set(renames.values())
+            entries = [("R" if p in renames else x, y, p) for x, y, p in entries if not (x == "D" and p in gone)]
+        s = Status(entries=entries, branch=self.refs.current_branch(), head=head, renames=renames)
         if untracked != "no":
             s.untracked = self.walk_untracked_candidates(index, collapse=(untracked == "normal"))
         return s
@@ -796,10 +819,11 @@ class Repo:
             for parent in self.read_commit(oid).parents:
                 push(parent)
 
-    def order_commits(self, commits, mode):
+    def order_commits(self, commits, mode, parents=None):
         """Reorder a walk result like git's ``--topo-order`` (no commit before all its children, a branch shown to the end before the next one starts) or
-        ``--date-order`` (the same guarantee, but the newest available commit first)."""
-        parents = {c: self.read_commit(c).parents for c in commits}
+        ``--date-order`` (the same guarantee, but the newest available commit first). ``parents`` overrides the parent lists (history simplification)."""
+        if parents is None:
+            parents = {c: self.read_commit(c).parents for c in commits}
         indegree = {c: 1 for c in commits}
         for c in commits:
             for p in parents[c]:
@@ -835,13 +859,16 @@ class Repo:
             out.append(c)
         return out
 
-    def format_commit(self, oid, oneline=False):
+    def format_commit(self, oid, oneline=False, parents=None, from_parent=None):
+        """``parents`` overrides the commit's own (history simplification and ``--graph`` rewrite them, and the ``Merge:`` line follows); ``from_parent`` marks the entry
+        of ``log -m`` that shows the merge against that parent."""
         c = self.read_commit(oid)
         if oneline:
-            return "%s %s" % (self.odb.abbrev(oid), c.subject)
-        lines = ["commit " + oid]
-        if len(c.parents) > 1:
-            lines.append("Merge: " + " ".join(self.odb.abbrev(p) for p in c.parents))
+            return "%s%s %s" % (self.odb.abbrev(oid), " (from %s)" % self.odb.abbrev(from_parent) if from_parent else "", c.subject)
+        parents = c.parents if parents is None else parents
+        lines = ["commit " + oid + (" (from %s)" % from_parent if from_parent else "")]
+        if len(parents) > 1:
+            lines.append("Merge: " + " ".join(self.odb.abbrev(p) for p in parents))
         lines.append("Author: %s <%s>" % (c.author.name, c.author.email))
         lines.append("Date:   " + format_date(c.author))
         lines.append("")
@@ -859,14 +886,18 @@ class Repo:
         return [(path, self._blob_side(*o) if o else None, self._blob_side(*n) if n else None)
                 for path, o, n in df.diff_flat(old, new) if paths is None or paths.match(path)]
 
-    def index_files(self, index=None):
+    def index_files(self, index=None, lenient=False):
         index = index or self.read_index()
-        return {e.path: (e.mode, e.oid) for e in index.stage_zero()}
+        return {e.path: (e.mode, e.oid) for e in (index.zero_entries() if lenient else index.stage_zero())}
 
-    def _worktree_changes(self, index, base, paths):
-        """Changes from ``base`` (``{path: Side-source}``: a snapshot of (mode, oid)) to the work tree files of the paths tracked in the index."""
+    def _worktree_changes(self, index, base, paths, unmerged=False, stage=0):
+        """Changes from ``base`` (``{path: Side-source}``: a snapshot of (mode, oid)) to the work tree files of the tracked paths. With ``unmerged`` a path with conflicts
+        becomes an ``Unmerged`` entry (what ``git diff`` of the index against the work tree does); otherwise it is just a tracked file."""
+        if self.worktree is None:
+            raise GitError("this operation must be run in a work tree (this is a bare repository)")
         out = []
-        tracked = {e.path for e in index.stage_zero()}
+        conflicts = index.unmerged()
+        tracked = {e.path for e in index.zero_entries()} | set(conflicts)
         for path in sorted(set(base) | tracked, key=sort_key):
             if paths is not None and not paths.match(path):
                 continue
@@ -880,6 +911,9 @@ class Repo:
             if exists:
                 mode, data = self.read_worktree(path, st)
                 new = df.file_side(mode, hash_object("blob", data), data)
+            if unmerged and path in conflicts:
+                out.append((path, df.Unmerged({n: (e.mode, e.oid) for n, e in conflicts[path].items()}, new, stage=stage), None))
+                continue
             old_side = self._blob_side(*old) if old else None
             if old is None and new is None:
                 continue
@@ -890,57 +924,115 @@ class Repo:
                 out.append((path, old_side, new))
         return out
 
-    def changes_worktree(self, paths=None):
-        """Index versus work tree (``git diff``)."""
+    def changes_worktree(self, paths=None, stage=0):
+        """Index versus work tree (``git diff``); paths with conflicts come as ``Unmerged`` entries."""
         index = self.read_index()
-        return self._worktree_changes(index, self.index_files(index), paths)
+        return self._worktree_changes(index, self.index_files(index, lenient=True), paths, unmerged=True, stage=stage)
 
     def changes_against_commit(self, commit, paths=None):
         """A commit versus the work tree (``git diff <commit>``)."""
         return self._worktree_changes(self.read_index(), self.tree_files(self.read_commit(commit).tree), paths)
 
     def changes_cached(self, against=None, paths=None):
-        """A commit (``HEAD`` unless given) versus the index: what a commit would record."""
+        """A commit (``HEAD`` unless given) versus the index: what a commit would record; paths with conflicts come as ``Unmerged`` entries."""
         base = self.tree_files(self.read_commit(against).tree) if against is not None else self.head_files()
-        return self.changes_snapshots(base, self.index_files(), paths)
+        index = self.read_index()
+        conflicts = index.unmerged()
+        changes = self.changes_snapshots({p: v for p, v in base.items() if p not in conflicts}, self.index_files(index, lenient=True), paths)
+        for path, stages in conflicts.items():
+            if paths is None or paths.match(path):
+                changes.append((path, df.Unmerged({n: (e.mode, e.oid) for n, e in stages.items()}, None, cached=True), None))
+        return sorted(changes, key=lambda c: sort_key(c[0]))
 
     def changes_commits(self, a, b, paths=None):
         old = self.tree_files(self.read_commit(a).tree) if a else {}
         new = self.tree_files(self.read_commit(b).tree) if b else {}
         return self.changes_snapshots(old, new, paths)
 
-    def commit_changes(self, oid):
+    def commit_changes(self, oid, paths=None):
         """The changes a commit made against its first parent (against the empty tree for a root commit)."""
         parents = self.read_commit(oid).parents
-        return self.changes_commits(parents[0] if parents else None, oid)
+        return self.changes_commits(parents[0] if parents else None, oid, paths)
 
-    def render_changes(self, changes, context=3):
-        return b"".join(df.render_change(path, old, new, self.odb.abbrev, context) for path, old, new in changes)
+    def detect_renames(self, changes, threshold=None):
+        """Pair deletions with additions in a change list (``threshold`` is the minimum similarity out of 60000, or None to leave the list alone)."""
+        if threshold is None:
+            return changes
+        return rn.detect_renames(changes, minimum_score=threshold)
 
-    def diff_snapshots(self, old, new, context=3, paths=None):
-        return self.render_changes(self.changes_snapshots(old, new, paths), context)
+    def render_changes(self, changes, context=3, dense=True):
+        """The patch text of a change list. Conflicted paths with both an ``ours`` and a ``theirs`` side get a combined diff of the work tree file, and those are written
+        first (git prints them as it finds them and the rest when everything is collected); other conflicted paths are announced as unmerged."""
+        combined, queued = [], []
+        for path, old, new in changes:
+            if not isinstance(old, df.Unmerged):
+                queued.append(df.render_change(path, old, new, self.odb.abbrev, context))
+                continue
+            st = old.stages
+            want = old.stage or 2
+            if not old.cached and not old.stage and 2 in st and 3 in st:
+                combined.append(cb.combined_patch(path, self._worktree_side(old.worktree), [self._lazy_side(st[2]), self._lazy_side(st[3])], self.odb.abbrev,
+                                                  dense=dense, context=context, force_header=True))
+                continue
+            queued.append(b"* Unmerged path %s\n" % df.quote_path(path).encode())
+            if not old.cached and want in st and old.worktree is not None and (old.worktree.mode, old.worktree.oid) != st[want]:
+                queued.append(df.render_change(path, self._blob_side(*st[want]), old.worktree, self.odb.abbrev, context))
+            elif not old.cached and want in st and old.worktree is None:
+                queued.append(df.render_change(path, self._blob_side(*st[want]), None, self.odb.abbrev, context))
+        return b"".join(combined + queued)
 
-    def diff_worktree(self, paths=None, context=3):
-        return self.render_changes(self.changes_worktree(paths), context)
+    def _worktree_side(self, side):
+        """A work tree file as a ``(mode, oid, data)`` triple for a combined diff; git shows its id as all zeros."""
+        if side is None:
+            return (0, None, b"")
+        return (side.mode, NULL_OID, side.data)
 
-    def diff_against_commit(self, commit, paths=None, context=3):
-        return self.render_changes(self.changes_against_commit(commit, paths), context)
+    def diff_snapshots(self, old, new, context=3, paths=None, renames=rn.DEFAULT_MINIMUM_SCORE):
+        return self.render_changes(self.detect_renames(self.changes_snapshots(old, new, paths), renames), context)
 
-    def diff_cached(self, against=None, paths=None, context=3):
-        return self.render_changes(self.changes_cached(against, paths), context)
+    def diff_worktree(self, paths=None, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
+        return self.render_changes(self.detect_renames(self.changes_worktree(paths), renames), context)
 
-    def diff_commits(self, a, b, paths=None, context=3):
-        return self.render_changes(self.changes_commits(a, b, paths), context)
+    def diff_against_commit(self, commit, paths=None, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
+        return self.render_changes(self.detect_renames(self.changes_against_commit(commit, paths), renames), context)
 
-    def show_commit(self, oid, context=3):
+    def diff_cached(self, against=None, paths=None, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
+        return self.render_changes(self.detect_renames(self.changes_cached(against, paths), renames), context)
+
+    def diff_commits(self, a, b, paths=None, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
+        return self.render_changes(self.detect_renames(self.changes_commits(a, b, paths), renames), context)
+
+    def combined_diff(self, oid, parents=None, dense=True, context=3, paths=None):
+        """The ``diff --cc`` (``dense``) or ``diff --combined`` text of a merge commit: the paths in which the result differs from every parent."""
+        c = self.read_commit(oid)
+        parents = c.parents if parents is None else parents
+        result = self.tree_files(c.tree)
+        sides = [self.tree_files(self.read_commit(p).tree) for p in parents]
+        out = []
+        for path in sorted(result.keys() | set().union(*[s.keys() for s in sides]), key=lambda p: p.encode("utf-8", "surrogateescape")):
+            if paths is not None and not paths.match(path, mark=False):
+                continue
+            r = result.get(path)
+            if all(s.get(path) == r for s in sides) or any(s.get(path) == r for s in sides):
+                continue                                                  # taken unchanged from some parent: not a combined change
+            out.append(cb.combined_patch(path, self._lazy_side(r), [self._lazy_side(s.get(path)) for s in sides], self.odb.abbrev, dense=dense, context=context))
+        return b"".join(out)
+
+    def _lazy_side(self, entry):
+        if entry is None:
+            return (0, None, b"")
+        mode, oid = entry
+        return (mode, oid, lambda: self.odb.read(oid)[1])
+
+    def show_commit(self, oid, context=3, dense=True, renames=rn.DEFAULT_MINIMUM_SCORE):
         c = self.read_commit(oid)
         text = self.format_commit(oid).encode("utf-8", "surrogateescape")
         if len(c.parents) > 1:
-            return text + b"\n(merge commit: the combined diff is not implemented; compare with `kgit diff <parent> <commit>`)\n"
-        patch = self.diff_commits(c.parents[0] if c.parents else None, oid, context=context)
+            return text + b"\n" + self.combined_diff(oid, dense=dense, context=context)          # the empty line comes even when no path is left to show
+        patch = self.diff_commits(c.parents[0] if c.parents else None, oid, context=context, renames=renames)
         return text + (b"\n" + patch if patch else b"")
 
-    def show_tag(self, oid, context=3):
+    def show_tag(self, oid, context=3, renames=rn.DEFAULT_MINIMUM_SCORE):
         """``git show`` of an annotated tag: the tag's own header and message, then what it points at."""
         tag = Tag.parse(self.odb.read(oid)[1])
         lines = ["tag " + tag.name]
